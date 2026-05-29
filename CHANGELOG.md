@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+
+- New setting `shader-validator.variantFolder` to auto-import shader variants from a JSON config file (`<shader>.variants.json` or `<shader>.json`) when opening a shader. The config is re-read when switching the active variant so it always reflects the latest data on disk. Resolves [#46](https://github.com/antaalt/shader-validator/issues/46).
+
 ## [1.3.3] - 2026-05-24
 
 ### Added

@@ -108,6 +108,125 @@ export type ShaderEntryPoint = {
 
 export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVariantDefineList | ShaderVariantIncludeList | ShaderVariantDefine | ShaderVariantInclude | ShaderVariantStage;
 
+// Configuration file schema used by the shader-validator.variantFolder import feature.
+// A config describes the variants of one shader (single-file form) or several (multi-file form).
+export interface ShaderVariantConfigVariant {
+    entryPoint: string,
+    stage?: string | null,
+    defines?: { [key: string]: string | number },
+    includes?: string[],
+}
+export interface ShaderVariantConfigFile {
+    file?: string,
+    language?: string,
+    variants: ShaderVariantConfigVariant[],
+}
+export interface ShaderVariantConfigMultiple {
+    files: ShaderVariantConfigFile[],
+}
+export type ShaderVariantConfig = ShaderVariantConfigFile | ShaderVariantConfigMultiple;
+
+function validateConfigVariants(variants: any, context: string): void {
+    if (!Array.isArray(variants)) {
+        throw new Error(`${context} must have a 'variants' array.`);
+    }
+    for (let i = 0; i < variants.length; i++) {
+        let variant = variants[i];
+        if (typeof variant !== 'object' || variant === null || typeof variant.entryPoint !== 'string' || variant.entryPoint.length === 0) {
+            throw new Error(`${context} variant #${i} must have a non-empty string 'entryPoint'.`);
+        }
+    }
+}
+
+// Parse & validate a shader variant config file content (JSON). Throws Error on invalid input.
+export function parseShaderVariantConfig(text: string): ShaderVariantConfig {
+    let parsed: any;
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        throw new Error(`Invalid JSON: ${e instanceof Error ? e.message : e}`);
+    }
+    if (typeof parsed !== 'object' || parsed === null) {
+        throw new Error("Expected a JSON object with a 'variants' or 'files' field.");
+    }
+    if (Array.isArray(parsed.files)) {
+        parsed.files.forEach((file: any, i: number) => validateConfigVariants(file?.variants, `'files' entry #${i}`));
+        return parsed as ShaderVariantConfigMultiple;
+    }
+    if (Array.isArray(parsed.variants)) {
+        validateConfigVariants(parsed.variants, "config");
+        return parsed as ShaderVariantConfigFile;
+    }
+    throw new Error("Expected a 'variants' array (single-file form) or a 'files' array (multi-file form).");
+}
+
+// Base name (file name without folder) of a path using forward or back slashes.
+function getBaseName(p: string): string {
+    let normalized = p.replace(/\\/g, '/');
+    let lastSlash = normalized.lastIndexOf('/');
+    return lastSlash >= 0 ? normalized.substring(lastSlash + 1) : normalized;
+}
+
+// Map a config stage string to the ShaderStage enum. Unknown / null / undefined => auto.
+function stageFromString(stage: string | null | undefined): ShaderStage {
+    if (stage === null || stage === undefined) {
+        return ShaderStage.auto;
+    }
+    let value = ShaderStage[stage as keyof typeof ShaderStage];
+    return (typeof value === 'number') ? value : ShaderStage.auto;
+}
+
+// Convert a parsed config into a list of ShaderVariant attached to the given uri. All imported
+// variants start inactive. openedBaseName (file name with extension) selects the matching entry
+// in the multi-file form.
+export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, openedBaseName: string): ShaderVariant[] {
+    let fileConfig: ShaderVariantConfigFile | undefined;
+    let files = (config as ShaderVariantConfigMultiple).files;
+    if (Array.isArray(files)) {
+        fileConfig = files.find(f => f.file !== undefined && getBaseName(f.file) === openedBaseName);
+        if (!fileConfig && files.length === 1) {
+            fileConfig = files[0];
+        }
+    } else {
+        fileConfig = config as ShaderVariantConfigFile;
+    }
+    if (!fileConfig || !Array.isArray(fileConfig.variants)) {
+        return [];
+    }
+    return fileConfig.variants.map((variant: ShaderVariantConfigVariant): ShaderVariant => {
+        let defines: ShaderVariantDefine[] = [];
+        if (variant.defines) {
+            for (let [label, value] of Object.entries(variant.defines)) {
+                defines.push({ kind: 'define', label: label, value: String(value) });
+            }
+        }
+        let includes: ShaderVariantInclude[] = (variant.includes || []).map((include: string): ShaderVariantInclude => {
+            return { kind: 'include', include: include };
+        });
+        return {
+            kind: 'variant',
+            uri: uri,
+            name: variant.entryPoint,
+            isActive: false,
+            stage: { kind: 'stage', stage: stageFromString(variant.stage) },
+            defines: { kind: 'defineList', defines: defines },
+            includes: { kind: 'includeList', includes: includes },
+        };
+    });
+}
+
+// Stable identity of a variant including its defines & includes. Needed because several variants
+// of the same shader often share entry point & stage and differ only by their defines (e.g. UE
+// permutations), so name+stage alone cannot tell them apart.
+export function variantSignature(variant: ShaderVariant): string {
+    return JSON.stringify({
+        name: variant.name,
+        stage: variant.stage.stage,
+        defines: variant.defines.defines.map(d => [d.label, d.value]),
+        includes: variant.includes.includes.map(i => i.include),
+    });
+}
+
 const shaderVariantTreeKey : string = 'shader-validator.shader-variant-tree-key';
 
 export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<ShaderVariantNode> {
@@ -152,27 +271,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             //dragAndDropController:
         });
         this.asyncGoToShaderEntryPoint = new Map;
-        this.tree.onDidChangeCheckboxState((e: vscode.TreeCheckboxChangeEvent<ShaderVariantNode>) => {
+        this.tree.onDidChangeCheckboxState(async (e: vscode.TreeCheckboxChangeEvent<ShaderVariantNode>) => {
             for (let [variant, checkboxState] of e.items) {
                 if (variant.kind === 'variant') {
                     if (checkboxState === vscode.TreeItemCheckboxState.Checked) {
-                        // Need to unset other possibles active ones to keep only one entry point active.
-                        for (let [url, file] of this.files) {
-                            let needRefresh = false;
-                            for (let otherVariant of file.variants) {
-                                if (otherVariant.isActive) {
-                                    needRefresh = true;
-                                    otherVariant.isActive = false;
-                                }
-                            }
-                            if (needRefresh) {
-                                // Refresh file & all its childs
-                                this.refresh(file, file);
-                            } else {
-                                this.refresh(variant, file);
-                            }
-                        }
-                        variant.isActive = true; // checked
+                        await this.activateVariantWithRefresh(variant);
                     } else {
                         variant.isActive = false; // unchecked
                         let file = this.files.get(variant.uri.path);
@@ -261,11 +364,23 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         for (let editor of vscode.window.visibleTextEditors) {
             if (editor.document.uri.scheme === 'file') {
                 this.shaderEntryPointList.set(editor.document.uri.path, []);
+                this.tryAutoImportVariants(editor.document);
             }
         }
         context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(document => {
             if (document.uri.scheme === 'file') {
                 this.shaderEntryPointList.set(document.uri.path, []);
+                this.tryAutoImportVariants(document);
+            }
+        }));
+        // Re-scan open shaders when the variant folder setting changes.
+        context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration("shader-validator.variantFolder")) {
+                for (let editor of vscode.window.visibleTextEditors) {
+                    if (editor.document.uri.scheme === 'file') {
+                        this.tryAutoImportVariants(editor.document);
+                    }
+                }
             }
         }));
         context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(document => {
@@ -651,6 +766,137 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             if (file.variants.length === 0) {
                 this.files.delete(uri.path);
                 this.refreshAll();
+            }
+        }
+    }
+    // Auto-import variants for a shader document from the shader-validator.variantFolder setting.
+    // Guards language & scheme then runs the async import as fire-and-forget.
+    private tryAutoImportVariants(document: vscode.TextDocument): void {
+        if (document.uri.scheme !== 'file' || !ShaderLanguageClient.isEnabledLangId(document.languageId)) {
+            return;
+        }
+        this.autoImportVariants(document.uri).catch(e => console.warn("Shader variant auto-import failed", e));
+    }
+    // Look up a JSON config file named after the shader in the configured variant folder and, if
+    // found, return the variants it describes (attached to uri). Returns null when no folder is
+    // configured, no config file exists, or parsing fails (logged, never throws). Pure I/O: does
+    // not mutate state nor fire events.
+    private async loadVariantsFromConfig(uri: vscode.Uri): Promise<ShaderVariant[] | null> {
+        if (uri.scheme !== 'file') {
+            return null;
+        }
+        let variantFolder = vscode.workspace.getConfiguration("shader-validator").get<string>("variantFolder");
+        if (!variantFolder || variantFolder.length === 0) {
+            return null;
+        }
+        let resolvedFolder = resolveVSCodeVariables(variantFolder);
+        if (resolvedFolder.length === 0) {
+            return null;
+        }
+        // Compute candidate config file names from the opened shader file name (e.g. FXAAShader.usf).
+        let openedBaseName = getBaseName(uri.path);
+        let dotIndex = openedBaseName.lastIndexOf('.');
+        let stem = dotIndex > 0 ? openedBaseName.substring(0, dotIndex) : openedBaseName; // e.g. FXAAShader
+        let candidates = [`${stem}.variants.json`, `${stem}.json`];
+        let folderUri = vscode.Uri.file(resolvedFolder);
+
+        let configUri: vscode.Uri | null = null;
+        for (let candidate of candidates) {
+            let candidateUri = vscode.Uri.joinPath(folderUri, candidate);
+            try {
+                await vscode.workspace.fs.stat(candidateUri);
+                configUri = candidateUri;
+                break;
+            } catch (e) {
+                // Not found, try next candidate.
+            }
+        }
+        if (!configUri) {
+            return null; // No config file for this shader.
+        }
+
+        try {
+            let bytes = await vscode.workspace.fs.readFile(configUri);
+            let text = new TextDecoder('utf-8').decode(bytes);
+            let config = parseShaderVariantConfig(text);
+            return configToVariants(uri, config, openedBaseName);
+        } catch (e) {
+            let message = `Failed to import shader variants from ${configUri.fsPath}: ${e instanceof Error ? e.message : e}`;
+            console.warn(message);
+            this.server.log(message);
+            return null;
+        }
+    }
+    // Load the config for a shader and replace its variants in the tree. The config file is the
+    // source of truth: re-opening the shader re-syncs the tree to the file.
+    private async autoImportVariants(uri: vscode.Uri): Promise<void> {
+        let variants = await this.loadVariantsFromConfig(uri);
+        if (variants) {
+            this.applyImportedVariants(uri, variants);
+        }
+    }
+    // Replace the variants of a file with imported ones, only if they actually differ (avoids
+    // churn & dirty edits when re-opening). Preserves the active selection when a matching
+    // variant still exists.
+    private applyImportedVariants(uri: vscode.Uri, variants: ShaderVariant[]): void {
+        let file = this.files.get(uri.path);
+        // Change detection by full signature, ignoring active state & order-independent of it.
+        let project = (vs: ShaderVariant[]) => JSON.stringify(vs.map(variantSignature));
+        if (file && project(file.variants) === project(variants)) {
+            return; // Nothing changed.
+        }
+        // Preserve active selection if a matching variant still exists in the new set.
+        let previousActive = file ? file.variants.find(v => v.isActive) : undefined;
+        if (previousActive) {
+            let previousSignature = variantSignature(previousActive);
+            let match = variants.find(v => variantSignature(v) === previousSignature);
+            if (match) {
+                match.isActive = true;
+            }
+        }
+        if (file) {
+            file.variants = variants;
+        } else {
+            file = { kind: 'file', uri: uri, variants: variants };
+            this.files.set(uri.path, file);
+        }
+        this.save();
+        this.onDidChangeTreeDataEmitter.fire();
+        this.notifyVariantChanged();
+        this.updateDecorations();
+    }
+    // Activate the clicked variant, re-reading its config from disk first
+    // (auto-refresh-config-before-switch). This keeps the switch in sync with the latest config
+    // without a file watcher. When no variant folder is configured, loadVariantsFromConfig returns
+    // null and this behaves like a plain activation.
+    private async activateVariantWithRefresh(clicked: ShaderVariant): Promise<void> {
+        let signature = variantSignature(clicked);
+        let reloaded = await this.loadVariantsFromConfig(clicked.uri);
+        let file = this.files.get(clicked.uri.path);
+        if (reloaded && file) {
+            let changed = JSON.stringify(file.variants.map(variantSignature)) !== JSON.stringify(reloaded.map(variantSignature));
+            if (changed) {
+                file.variants = reloaded;
+                this.refresh(file, file); // re-render the refreshed variant set
+            }
+        }
+        // The clicked node may have been replaced by the refresh: re-find it by signature.
+        let toActivate = file ? file.variants.find(v => variantSignature(v) === signature) : clicked;
+        if (file && !toActivate) {
+            vscode.window.showWarningMessage(`The selected shader variant no longer exists in the refreshed config for ${vscode.workspace.asRelativePath(clicked.uri)}.`);
+        }
+        // Keep a single active variant across all files.
+        for (let [, otherFile] of this.files) {
+            let needRefresh = false;
+            for (let other of otherFile.variants) {
+                let shouldBeActive = (toActivate !== undefined && other === toActivate);
+                if (other.isActive !== shouldBeActive) {
+                    other.isActive = shouldBeActive;
+                    needRefresh = true;
+                }
+            }
+            if (needRefresh) {
+                this.refresh(otherFile, otherFile);
             }
         }
     }

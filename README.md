@@ -101,6 +101,44 @@ You can add one with the dedicated window or using the command `shader-validator
 
 ![shader-variant](res/doc/variants.png)
 
+### Importing variants
+
+Defining variants by hand is tedious when a shader has many permutations. Instead, you can let the extension import them from a JSON config file. Set `shader-validator.variantFolder` to a folder, and when you open a shader the extension looks for `<name>.variants.json` then `<name>.json` in that folder (e.g. opening `FXAAShader.usf` loads `FXAAShader.json`). The config file is the source of truth: its variants **replace** the ones currently set for that shader, so re-opening the shader keeps the view in sync with the file. The config is also re-read when you switch the active variant, so toggling a variant always uses the latest data on disk.
+
+This is handy for engines such as Unreal that can dump every compiled permutation of a shader (entry point, stage and defines) to disk.
+
+```json
+{
+    "file": "D:/UnrealEngine/Engine/Shaders/Private/FXAAShader.usf",
+    "language": "hlsl",
+    "variants": [
+        {
+            "entryPoint": "FxaaPS",
+            "stage": "fragment",
+            "defines": { "DIM_ALPHA_CHANNEL": "0", "FXAA_PRESET": "0" },
+            "includes": []
+        },
+        {
+            "entryPoint": "FxaaPS",
+            "stage": "fragment",
+            "defines": { "DIM_ALPHA_CHANNEL": "1", "FXAA_PRESET": "0" },
+            "includes": []
+        }
+    ]
+}
+```
+
+`stage` accepts any of the supported stage names (`vertex`, `fragment`, `compute`, `geometry`, `mesh`, `task`, `rayGeneration`, `closestHit`, `anyHit`, `callable`, `miss`, `intersect`, `tesselationControl`, `tesselationEvaluation`); omit it or set it to `null` to let the server guess. A multi-file form is also accepted, where the entry matching the opened shader file name is used:
+
+```json
+{
+    "files": [
+        { "file": "D:/path/to/ShaderA.usf", "language": "hlsl", "variants": [ /* ... */ ] },
+        { "file": "D:/path/to/ShaderB.usf", "language": "hlsl", "variants": [ /* ... */ ] }
+    ]
+}
+```
+
 ### Regions
 
 Grey out inactive regions depending on currently declared preprocessor & filter symbols.
@@ -125,6 +163,7 @@ This extension contributes the following settings:
 *   `shader-validator.stageDefine.[vertex|fragment|compute...]`: All custom macros and their values for custom shader stages.
 *   `shader-validator.serverPath`: Use a custom server instead of the bundled one.
 *   `shader-validator.updateSymbolsOnVariantUpdate`: Update symbol outline when changing variant. Will trigger a save event.
+*   `shader-validator.variantFolder`: Folder to look up shader variant config files (JSON) and auto-import them when opening a shader. See [Importing variants](#importing-variants).
 *   `shader-validator.trace.server`: Show debug logs into an output channel. Can be accessed via shader-validator status bar.
 
 ### HLSL specific settings: 

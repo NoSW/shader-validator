@@ -281,6 +281,11 @@
             "description": "Use the wasi server instead of the native server. Only working for platform where DXC is available.",
             "type": "boolean",
             "default": false
+          },
+          "shader-validator.variantFolder": {
+            "description": "Folder to look up shader variant config files (JSON). When you open a shader, the extension loads <name>.variants.json or <name>.json from this folder and replaces that shader's variants in the Shader variants view. The config file is the source of truth. Supports ${workspaceFolder}, ${env:VAR} and ${userHome}.",
+            "type": "string",
+            "default": ""
           }
         }
       },
