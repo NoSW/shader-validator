@@ -93,6 +93,7 @@ export type ShaderVariant = {
     kind: 'variant';
     uri: vscode.Uri;
     name: string;
+    custom?: string;
     isActive: boolean;
     // Per variant data
     stage: ShaderVariantStage;
@@ -173,6 +174,7 @@ export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVarian
 // A config describes the variants of one shader (single-file form) or several (multi-file form).
 export interface ShaderVariantConfigVariant {
     entryPoint: string,
+    custom?: string,
     stage?: string | null,
     defines?: { [key: string]: string | number },
     includes?: string[],
@@ -289,6 +291,7 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
             kind: 'variant',
             uri: uri,
             name: variant.entryPoint,
+            custom: typeof variant.custom === 'string' && variant.custom.length > 0 ? variant.custom : undefined,
             isActive: false,
             stage: { kind: 'stage', stage: stageFromString(variant.stage) },
             defines: { kind: 'defineList', defines: defines },
@@ -303,6 +306,7 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
 export function variantSignature(variant: ShaderVariant): string {
     return JSON.stringify({
         name: variant.name,
+        custom: variant.custom ?? null,
         stage: variant.stage.stage,
         defines: variant.defines.defines.map(d => [d.label, d.value]),
         includes: variant.includes.includes.map(i => i.include),
@@ -609,10 +613,19 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 return;
             }
             const uri = document.uri;
+            const existingFile = this.files.get(uri.path);
+            if (existingFile) {
+                this.revealFile(existingFile);
+                return;
+            }
             const imported = await this.importVariantsFromConfig(uri, true);
             if (!imported) {
                 this.open(uri);
                 vscode.window.showInformationMessage(`No variant config found for ${vscode.workspace.asRelativePath(uri)}. Added the file without imported variants.`);
+            }
+            const file = this.files.get(uri.path);
+            if (file) {
+                this.revealFile(file);
             }
             this.save();
         }));
@@ -1260,7 +1273,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     permutations: group.permutations.map((p, index): ShaderPermutation => ({
                         kind: 'permutation',
                         variant: p.variant,
-                        label: `#${index}`,
+                        label: p.variant.custom && p.variant.custom.length > 0 ? `#${index} [${p.variant.custom}]` : `#${index}`,
                         deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
                     })),
                 },
