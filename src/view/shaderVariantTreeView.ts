@@ -618,10 +618,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 this.revealFile(existingFile);
                 return;
             }
-            const imported = await this.importVariantsFromConfig(uri, true);
-            if (!imported) {
+            const importedCount = await this.importVariantsFromConfig(uri, true);
+            if (importedCount === 0) {
                 this.open(uri);
-                vscode.window.showInformationMessage(`No variant config found for ${vscode.workspace.asRelativePath(uri)}. Added the file without imported variants.`);
             }
             const file = this.files.get(uri.path);
             if (file) {
@@ -694,6 +693,29 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 } else {
                     this.notifyVariantChanged();
                 }
+            }
+        ));
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.copyDefineName",
+            async (node?: ShaderVariantNode) => {
+                const text = node ? this.getCopySearchText(node) : undefined;
+                if (text) {
+                    await vscode.env.clipboard.writeText(text);
+                }
+            }
+        ));
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.searchDefineName",
+            async (node?: ShaderVariantNode) => {
+                if (!node) {
+                    return;
+                }
+                const text = this.getCopySearchText(node);
+                const uri = this.resolveShaderFileUri(node);
+                if (!text || !uri) {
+                    return;
+                }
+                await this.jumpToFirstMatch(uri, text);
             }
         ));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.editMenu", async (node: ShaderVariantNode) => {
@@ -1333,6 +1355,60 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         return null;
     }
     // Resolve a selectionKey back to the owning ShaderEntryGroup (if cached).
+    private getCopySearchText(node: ShaderVariantNode): string | undefined {
+        if (node.kind === 'varyingDefine' || node.kind === 'readonlyDefine') {
+            return node.label;
+        }
+        if (node.kind === 'entryGroup') {
+            return node.name;
+        }
+        return undefined;
+    }
+    private resolveShaderFileUri(node: ShaderVariantNode): vscode.Uri | undefined {
+        if (node.kind === 'entryGroup') {
+            return node.uri;
+        }
+        if (node.kind === 'varyingDefine') {
+            return this.lookupEntryGroup(node.selectionKey)?.uri;
+        }
+        if (node.kind === 'readonlyDefine') {
+            let parent: ShaderVariantNode | undefined = this.getParent(node);
+            while (parent) {
+                if (parent.kind === 'entryGroup') {
+                    return parent.uri;
+                }
+                parent = this.getParent(parent);
+            }
+        }
+        return undefined;
+    }
+    private async jumpToFirstMatch(uri: vscode.Uri, searchString: string): Promise<void> {
+        let editor = vscode.window.activeTextEditor;
+        if (!editor || editor.document.uri.toString() !== uri.toString()) {
+            editor = await vscode.window.showTextDocument(uri, {
+                preserveFocus: false,
+                preview: false,
+            });
+        }
+        await vscode.commands.executeCommand('actions.find');
+        await vscode.commands.executeCommand('editor.actions.findWithArgs', {
+            searchString,
+            isRegex: false,
+            matchWholeWord: true,
+            isCaseSensitive: true,
+            preserveCase: false,
+        });
+        const document = editor.document;
+        const escaped = searchString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escaped}\\b`);
+        const match = regex.exec(document.getText());
+        if (match) {
+            const start = document.positionAt(match.index);
+            const end = document.positionAt(match.index + match[0].length);
+            editor.selection = new vscode.Selection(start, end);
+            editor.revealRange(new vscode.Range(start, end), vscode.TextEditorRevealType.InCenter);
+        }
+    }
     private lookupEntryGroup(selectionKey: string): ShaderEntryGroup | undefined {
         const idx = selectionKey.lastIndexOf('::');
         if (idx < 0) { return undefined; }
@@ -1563,15 +1639,24 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         let merged = mergeVariantConfigs(uri, configs, openedBaseName);
         return merged.length > 0 ? merged : null;
     }
-    // Load the config(s) for a shader and replace its variants in the tree. Returns true when JSON
+    // Load the config(s) for a shader and replace its variants in the tree. Returns the imported
     // configs were found and applied. Used only by explicit user actions (Refresh / Add File).
-    private async importVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = true): Promise<boolean> {
-        let variants = await this.loadVariantsFromConfig(uri, forceRescan);
-        if (variants) {
-            this.applyImportedVariants(uri, variants);
-            return true;
+    private async importVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = true): Promise<number> {
+        const statusMessage = vscode.window.setStatusBarMessage("collect variant json...");
+        try {
+            let variants = await this.loadVariantsFromConfig(uri, forceRescan);
+            if (variants) {
+                this.applyImportedVariants(uri, variants);
+                vscode.window.showInformationMessage(
+                    `Collected ${variants.length} variant json entr${variants.length === 1 ? "y" : "ies"} for ${vscode.workspace.asRelativePath(uri)}.`,
+                );
+                return variants.length;
+            }
+            vscode.window.showWarningMessage(`No variant json found for ${vscode.workspace.asRelativePath(uri)}.`);
+            return 0;
+        } finally {
+            statusMessage.dispose();
         }
-        return false;
     }
     // Replace the variants of a file with imported ones, only if they actually differ (avoids
     // churn & dirty edits when re-opening). Preserves the active selection when a matching

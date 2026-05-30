@@ -10,7 +10,7 @@ export class ShaderStatusBar {
     constructor(context: vscode.ExtensionContext, server: ShaderLanguageClient) {
         this.server = server;
         this.isDevel = context.extensionMode === vscode.ExtensionMode.Development;
-        this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+        this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
         this.statusBar.text = `shader-validator`;
         this.updateStatusBar();
         this.server.onStatusChanged(_ => {

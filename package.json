@@ -536,6 +536,18 @@
         "title": "Reparse current shader variant",
         "category": "Shader validator",
         "icon": "$(sync)"
+      },
+      {
+        "command": "shader-validator.copyDefineName",
+        "title": "Copy define name",
+        "category": "Shader validator",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "shader-validator.searchDefineName",
+        "title": "Search define name",
+        "category": "Shader validator",
+        "icon": "$(search)"
       }
     ],
     "menus": {
@@ -579,8 +591,18 @@
           "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == stage)"
         },
         {
-          "command": "shader-validator.deleteMenu",
+          "command": "shader-validator.copyDefineName",
+          "group": "inline@3",
+          "when": "view == shader-validator-variants && (viewItem == varyingDefine || viewItem == readonlyDefine || viewItem == entryGroup)"
+        },
+        {
+          "command": "shader-validator.searchDefineName",
           "group": "inline@4",
+          "when": "view == shader-validator-variants && (viewItem == varyingDefine || viewItem == readonlyDefine || viewItem == entryGroup)"
+        },
+        {
+          "command": "shader-validator.deleteMenu",
+          "group": "inline@5",
           "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == file)"
         }
       ]
