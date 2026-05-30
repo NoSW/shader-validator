@@ -44,8 +44,8 @@
           ".hlsli",
           ".fx",
           ".fxh",
-          "ush",
-          "usf"
+          ".ush",
+          ".usf"
         ],
         "icon": {
           "light": "./res/icons/hlsl-icon.svg",
@@ -524,6 +524,18 @@
         "title": "Go to shader entry point",
         "category": "Shader validator",
         "icon": "$(arrow-right)"
+      },
+      {
+        "command": "shader-validator.refreshVariants",
+        "title": "Refresh variants from config",
+        "category": "Shader validator",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "shader-validator.reparseCurrentVariant",
+        "title": "Reparse current shader variant",
+        "category": "Shader validator",
+        "icon": "$(sync)"
       }
     ],
     "menus": {
@@ -538,6 +550,16 @@
           "command": "shader-validator.addCurrentFile",
           "when": "view == shader-validator-variants && editorIsOpen",
           "group": "navigation"
+        },
+        {
+          "command": "shader-validator.refreshVariants",
+          "when": "view == shader-validator-variants && editorIsOpen",
+          "group": "navigation"
+        },
+        {
+          "command": "shader-validator.reparseCurrentVariant",
+          "when": "view == shader-validator-variants",
+          "group": "navigation"
         }
       ],
       "view/item/context": [
@@ -547,13 +569,18 @@
           "when": "view == shader-validator-variants && (viewItem == file || viewItem == includeList || viewItem == defineList)"
         },
         {
-          "command": "shader-validator.editMenu",
+          "command": "shader-validator.refreshVariants",
           "group": "inline@2",
+          "when": "view == shader-validator-variants && viewItem == file"
+        },
+        {
+          "command": "shader-validator.editMenu",
+          "group": "inline@3",
           "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == stage)"
         },
         {
           "command": "shader-validator.deleteMenu",
-          "group": "inline@3",
+          "group": "inline@4",
           "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == file)"
         }
       ]

@@ -11,13 +11,18 @@ interface ShaderVariantSerialized {
     includes: string[],
 }
 
-function shaderVariantToSerialized(url: DocumentUri, languageId: string, e: ShaderVariant) : ShaderVariantSerialized {
+function shaderVariantToSerialized(
+    url: DocumentUri,
+    languageId: string,
+    e: ShaderVariant,
+    definesOverride?: { [key: string]: string },
+) : ShaderVariantSerialized {
     return {
         url: url,
         shadingLanguage: languageId,
         entryPoint: e.name,
         stage: (e.stage.stage === ShaderStage.auto) ? null : ShaderStage[e.stage.stage],
-        defines: Object.fromEntries(e.defines.defines.map(e => [e.label, e.value])),
+        defines: definesOverride ?? Object.fromEntries(e.defines.defines.map(e => [e.label, e.value])),
         includes: e.includes.includes.map(e => resolveVSCodeVariables(e.include))
     };
 }
@@ -124,6 +129,30 @@ export type ShaderPermutation = {
     deltaDefines: ShaderReadonlyDefine[],
 };
 export type ShaderPermutationList = { kind: 'permutationList', permutations: ShaderPermutation[] };
+
+// --- Varying defines (interactive define-matrix selector) ---
+// Lists every (key,value) pair that differs across an entry group's permutations. Each value has a
+// checkbox; checking a value auto-clears sibling values for the same key (radio behaviour via the
+// varyingSelection map). The parent label shows the matched permutation index or "#invalid".
+export type ShaderVaryingDefineValue = {
+    kind: 'varyingDefineValue',
+    label: string,           // the value (e.g. "0", "1")
+    defineKey: string,       // parent key (e.g. "DIM_ALPHA_CHANNEL")
+    selectionKey: string,    // composite "${filePath}::${entryGroupName}"
+    flat: boolean,           // true when this is rendered flat under varyingDefineList (2-value key)
+};
+export type ShaderVaryingDefine = {
+    kind: 'varyingDefine',
+    label: string,           // the define key name
+    selectionKey: string,
+    values: ShaderVaryingDefineValue[],
+};
+export type ShaderVaryingDefineList = {
+    kind: 'varyingDefineList',
+    selectionKey: string,
+    defines: ShaderVaryingDefine[],
+};
+
 export type ShaderEntryGroup = {
     kind: 'entryGroup',
     uri: vscode.Uri,
@@ -131,12 +160,14 @@ export type ShaderEntryGroup = {
     permutationCount: number,
     stageNode: ShaderGroupStage,
     commonDefineList: ShaderCommonDefineList,
+    varyingDefineList: ShaderVaryingDefineList,
     includeList: ShaderGroupIncludeList,
     permutationList: ShaderPermutationList,
 };
 
 export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVariantDefineList | ShaderVariantIncludeList | ShaderVariantDefine | ShaderVariantInclude | ShaderVariantStage
-    | ShaderEntryGroup | ShaderGroupStage | ShaderCommonDefineList | ShaderGroupIncludeList | ShaderPermutationList | ShaderPermutation | ShaderReadonlyDefine | ShaderReadonlyInclude;
+    | ShaderEntryGroup | ShaderGroupStage | ShaderCommonDefineList | ShaderGroupIncludeList | ShaderPermutationList | ShaderPermutation | ShaderReadonlyDefine | ShaderReadonlyInclude
+    | ShaderVaryingDefineList | ShaderVaryingDefine | ShaderVaryingDefineValue;
 
 // Configuration file schema used by the shader-validator.variantFolder import feature.
 // A config describes the variants of one shader (single-file form) or several (multi-file form).
@@ -357,6 +388,41 @@ export function groupVariantsByEntryPoint(variants: ShaderVariant[]): EntryGroup
     });
 }
 
+// Build the vary-defines projection for a single entry group. Returns null when there are no
+// varying keys (single-permutation group), so the caller can hide the varyingDefineList node.
+function buildVaryingDefines(group: EntryGroupData, selectionKey: string): ShaderVaryingDefineList | null {
+    const keyToValues = new Map<string, Set<string>>();
+    for (const perm of group.permutations) {
+        for (const d of perm.deltaDefines) {
+            let values = keyToValues.get(d.label);
+            if (!values) { values = new Set<string>(); keyToValues.set(d.label, values); }
+            values.add(d.value);
+        }
+    }
+    if (keyToValues.size === 0) {
+        return null;
+    }
+    const defines: ShaderVaryingDefine[] = [];
+    for (const [key, values] of keyToValues) {
+        const isFlat = values.size <= 2;
+        const valueNodes: ShaderVaryingDefineValue[] = [...values].sort().map(v => ({
+            kind: 'varyingDefineValue' as const,
+            label: v,
+            defineKey: key,
+            selectionKey,
+            flat: isFlat,
+        }));
+        defines.push({
+            kind: 'varyingDefine' as const,
+            label: key,
+            selectionKey,
+            values: valueNodes,
+        });
+    }
+    defines.sort((a, b) => a.label.localeCompare(b.label));
+    return { kind: 'varyingDefineList', selectionKey, defines };
+}
+
 const shaderVariantTreeKey : string = 'shader-validator.shader-variant-tree-key';
 
 export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<ShaderVariantNode> {
@@ -372,6 +438,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private workspaceState: vscode.Memento;
     private shaderEntryPointList: Map<string, ShaderEntryPoint[]>;
     private asyncGoToShaderEntryPoint: Map<vscode.Uri, string>;
+    private lastSentShaderVariant: ShaderVariantSerialized | null = null;
+    private lastSentShaderVariantUri: vscode.Uri | null = null;
+    private shaderVariantNotificationQueue: Promise<void> = Promise.resolve();
     // Cached recursive listing of *.json files under the resolved variantFolder (rebuilt on open &
     // when the setting changes; reused while switching variants to avoid re-walking the tree).
     private jsonFileCache: { root: string, files: vscode.Uri[] } | null = null;
@@ -379,6 +448,37 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // identity preserves tree expansion/checkbox state; invalidated only when a file's variants
     // change (membership/defines), not on a plain active toggle. Built lazily by getChildren.
     private groupCache: Map<string, ShaderEntryGroup[]> = new Map();
+    // Per-entry-group varying define selection: "${filePath}::${entryGroupName}" → Map<defineKey, selectedValue>.
+    // Updated on permutation checkbox / varyingDefineValue checkbox changes, or initialized from the
+    // active permutation when groups are built.  Keyed by string so it survives groupCache invalidation.
+    private varyingSelection: Map<string, Map<string, string>> = new Map();
+
+    private inferShaderLanguageId(uri: vscode.Uri): string | null {
+        const path = uri.path.toLowerCase();
+        if (path.endsWith('.hlsl') || path.endsWith('.hlsli') || path.endsWith('.fx') || path.endsWith('.fxh')
+            || path.endsWith('.ush') || path.endsWith('.usf')) {
+            return 'hlsl';
+        }
+        if (path.endsWith('.glsl') || path.endsWith('.vert') || path.endsWith('.frag') || path.endsWith('.mesh')
+            || path.endsWith('.task') || path.endsWith('.comp') || path.endsWith('.geom')
+            || path.endsWith('.tesc') || path.endsWith('.tese')) {
+            return 'glsl';
+        }
+        if (path.endsWith('.wgsl')) {
+            return 'wgsl';
+        }
+        return null;
+    }
+    private canManageShaderDocument(document: vscode.TextDocument | undefined): document is vscode.TextDocument {
+        if (!document || document.uri.scheme !== 'file') {
+            return false;
+        }
+        if (ShaderLanguageClient.isEnabledLangId(document.languageId)) {
+            return true;
+        }
+        const inferred = this.inferShaderLanguageId(document.uri);
+        return inferred !== null && ShaderLanguageClient.isEnabledLangId(inferred);
+    }
 
     private load() {
         let variants : ShaderVariantFile[] = this.workspaceState.get<ShaderVariantFile[]>(shaderVariantTreeKey, []);
@@ -409,11 +509,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         });
         this.asyncGoToShaderEntryPoint = new Map;
         this.tree.onDidChangeCheckboxState(async (e: vscode.TreeCheckboxChangeEvent<ShaderVariantNode>) => {
+            let varyingToggled = false;
             for (let [node, checkboxState] of e.items) {
                 if (node.kind === 'permutation') {
                     let variant = node.variant;
                     if (checkboxState === vscode.TreeItemCheckboxState.Checked) {
+                        this.syncVaryingSelectionFromVariant(variant);
                         await this.activateVariantWithRefresh(variant);
+                        // After reload may have invalidated groupCache; sync again defensively.
+                        this.syncVaryingSelectionFromVariant(variant);
                     } else {
                         variant.isActive = false; // unchecked
                         let file = this.files.get(variant.uri.path);
@@ -421,9 +525,64 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                             this.refresh(file, file);
                         }
                     }
+                } else if (node.kind === 'varyingDefineValue') {
+                    varyingToggled = true;
+                    if (checkboxState === vscode.TreeItemCheckboxState.Checked) {
+                        // Radio behaviour falls out naturally: setting the same key in the Map
+                        // overwrites the previous value; getTreeItem reads the new value and
+                        // renders the sibling unchecked on the next refresh.
+                        let sel = this.varyingSelection.get(node.selectionKey);
+                        if (!sel) {
+                            sel = new Map<string, string>();
+                            this.varyingSelection.set(node.selectionKey, sel);
+                        }
+                        sel.set(node.defineKey, node.label);
+
+                        // If every varying key now has a value, try to match a permutation.
+                        const ownerGroup = this.lookupEntryGroup(node.selectionKey);
+                        if (ownerGroup) {
+                            const allVaryingKeys = ownerGroup.varyingDefineList.defines.map(d => d.label);
+                            if (allVaryingKeys.every(k => sel!.has(k))) {
+                                const match = this.findMatchingPermutation(ownerGroup, sel);
+                                if (match) {
+                                    this.syncVaryingSelectionFromVariant(match.variant);
+                                    await this.activateVariantWithRefresh(match.variant);
+                                } else {
+                                    // Invalid combination: still re-parse with selected defines.
+                                    this.notifyVaryingSelection(node.selectionKey, sel);
+                                }
+                            } else {
+                                // Incomplete: notify with partial selection so the server
+                                // re-parses using whatever varying defines the user has picked.
+                                this.notifyVaryingSelection(node.selectionKey, sel);
+                            }
+                        }
+                    } else {
+                        // Unchecked: remove this key from the selection.
+                        const sel = this.varyingSelection.get(node.selectionKey);
+                        if (sel) {
+                            sel.delete(node.defineKey);
+                            if (sel.size === 0) {
+                                this.varyingSelection.delete(node.selectionKey);
+                                // No keys left: notify the server with only common defines.
+                                this.notifyVaryingClear(node.selectionKey);
+                            } else {
+                                // Remaining partial selection: keep the server current.
+                                this.notifyVaryingSelection(node.selectionKey, sel);
+                            }
+                        }
+                    }
+                    // Re-render checkbox / label state without re-sending the active permutation,
+                    // otherwise it would overwrite the custom varying-define notification we just sent.
+                    this.refreshTreeOnly();
                 }
             }
-            this.notifyVariantChanged();
+            // notifyVariantChanged would send the globally-active permutation or null — but when
+            // varying defines were toggled the varying-selection helpers above already sent the
+            // right defines (including synthetic ones for invalid/incomplete combinations).
+            if (!varyingToggled) {
+                this.notifyVariantChanged();
+            }
             this.save();
             this.updateDecorations();
         });
@@ -443,40 +602,51 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 borderStyle: 'solid',
             }));
         }
-        context.subscriptions.push(vscode.commands.registerCommand("shader-validator.addCurrentFile", (): void => {
-            if (vscode.window.activeTextEditor && ShaderLanguageClient.isEnabledLangId(vscode.window.activeTextEditor.document.languageId)) {
-                this.open(vscode.window.activeTextEditor.document.uri);
+        context.subscriptions.push(vscode.commands.registerCommand("shader-validator.addCurrentFile", async (): Promise<void> => {
+            const document = vscode.window.activeTextEditor?.document;
+            if (!this.canManageShaderDocument(document)) {
+                vscode.window.showWarningMessage("Add Current File requires an open local shader file (.usf/.ush/.hlsl/.glsl/.wgsl).");
+                return;
+            }
+            const uri = document.uri;
+            const imported = await this.importVariantsFromConfig(uri, true);
+            if (!imported) {
+                this.open(uri);
+                vscode.window.showInformationMessage(`No variant config found for ${vscode.workspace.asRelativePath(uri)}. Added the file without imported variants.`);
             }
             this.save();
         }));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.addCurrentFileVariant", async () => {
-            if (vscode.window.activeTextEditor && ShaderLanguageClient.isEnabledLangId(vscode.window.activeTextEditor.document.languageId)) {
-                let entryPoint = await this.promptEntryPoint();
-                if (entryPoint) {
-                    let stage = await this.promptShaderStage();
-                    if (stage) {
-                        let uri = vscode.window.activeTextEditor.document.uri;
-                        this.openOrAddVariant(uri, {
-                            kind: 'variant',
-                            uri: uri,
-                            name: entryPoint,
-                            isActive: true,
-                            stage: {
-                                kind: 'stage',
-                                stage: stage
-                            },
-                            defines: {
-                                kind: 'defineList',
-                                defines:[]
-                            },
-                            includes: {
-                                kind: 'includeList',
-                                includes:[]
-                            },
-                        });
+            const document = vscode.window.activeTextEditor?.document;
+            if (!this.canManageShaderDocument(document)) {
+                vscode.window.showWarningMessage("Add Current File Variant requires an open local shader file (.usf/.ush/.hlsl/.glsl/.wgsl).");
+                return;
+            }
+            let entryPoint = await this.promptEntryPoint();
+            if (entryPoint) {
+                let stage = await this.promptShaderStage();
+                if (stage) {
+                    let uri = document.uri;
+                    this.openOrAddVariant(uri, {
+                        kind: 'variant',
+                        uri: uri,
+                        name: entryPoint,
+                        isActive: true,
+                        stage: {
+                            kind: 'stage',
+                            stage: stage
+                        },
+                        defines: {
+                            kind: 'defineList',
+                            defines:[]
+                        },
+                        includes: {
+                            kind: 'includeList',
+                            includes:[]
+                        },
+                    });
                     }
                 }
-            }
             this.save();
         }));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.addMenu", async (node: ShaderVariantNode) => {
@@ -487,38 +657,59 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             this.delete(node);
             this.save();
         }));
+        // Manual "Refresh" button — re-reads variant JSON configs from disk for the given file
+        // (or the active editor's file when invoked from the view title bar).
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.refreshVariants",
+            async (node?: ShaderVariantNode) => {
+                let uri: vscode.Uri | undefined;
+                if (node && node.kind === 'file') {
+                    uri = node.uri;
+                } else if (vscode.window.activeTextEditor) {
+                    uri = vscode.window.activeTextEditor.document.uri;
+                }
+                if (uri) {
+                    await this.importVariantsFromConfig(uri, true);
+                }
+            }
+        ));
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.reparseCurrentVariant",
+            () => {
+                if (this.lastSentShaderVariant !== null || this.lastSentShaderVariantUri !== null) {
+                    this.sendShaderVariantNotification(this.lastSentShaderVariant, this.lastSentShaderVariantUri ?? undefined, true);
+                } else {
+                    this.notifyVariantChanged();
+                }
+            }
+        ));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.editMenu", async (node: ShaderVariantNode) => {
             await this.edit(node);
             this.save();
         }));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.gotoShaderEntryPoint", (uri: vscode.Uri, entryPointName: string) => {
-            // sometimes, its goes in random place in file... 
+            // sometimes, its goes in random place in file...
             // TODO: Should use regex & read diag region instead.
             let diagnostic = vscode.languages.getDiagnostics().find(([diagUri, diags]) => diagUri === uri);
-            
+
             this.goToShaderEntryPoint(uri, entryPointName, true);
         }));
         // Prepare entry point symbol cache
         for (let editor of vscode.window.visibleTextEditors) {
             if (editor.document.uri.scheme === 'file') {
                 this.shaderEntryPointList.set(editor.document.uri.path, []);
-                this.tryAutoImportVariants(editor.document);
             }
         }
         context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(document => {
             if (document.uri.scheme === 'file') {
                 this.shaderEntryPointList.set(document.uri.path, []);
-                this.tryAutoImportVariants(document);
             }
         }));
-        // Re-scan open shaders when the variant folder setting changes.
+        // Setting changes only invalidate the cached JSON file listing. Variant data is refreshed
+        // explicitly via the Refresh command or when the user clicks Add File.
         context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
             if (event.affectsConfiguration("shader-validator.variantFolder")) {
-                for (let editor of vscode.window.visibleTextEditors) {
-                    if (editor.document.uri.scheme === 'file') {
-                        this.tryAutoImportVariants(editor.document);
-                    }
-                }
+                this.jsonFileCache = null;
             }
         }));
         context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(document => {
@@ -676,6 +867,69 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         this.onDidChangeTreeDataEmitter.fire();
         this.updateDependencies();
     }
+    private refreshTreeOnly() {
+        this.onDidChangeTreeDataEmitter.fire();
+    }
+    private withShaderAnalysisProgress<T>(uri: vscode.Uri | undefined, work: () => Promise<T>): Promise<T> {
+        if (!uri) {
+            return work();
+        }
+        return Promise.resolve(vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Window,
+                title: `Analyzing shader files: 1/1 ${getBaseName(uri.path)}`,
+            },
+            async () => await work(),
+        ));
+    }
+    private sendShaderVariantNotification(shaderVariant: ShaderVariantSerialized | null, symbolUri?: vscode.Uri, forceReset: boolean = false) {
+        const previous = this.lastSentShaderVariant;
+        const shouldForceTransition = forceReset || (previous !== null
+            && shaderVariant !== null
+            && JSON.stringify(previous) !== JSON.stringify(shaderVariant));
+        this.lastSentShaderVariant = shaderVariant;
+        this.lastSentShaderVariantUri = symbolUri ?? null;
+        this.shaderVariantNotificationQueue = this.shaderVariantNotificationQueue
+            .then(async () => {
+                if (shouldForceTransition) {
+                    await this.server.sendNotification(didChangeShaderVariantNotification, {
+                        shaderVariant: null,
+                    });
+                    // Separate "clear old variant" from "apply new variant" so the server does
+                    // not batch them into the same processing pass.
+                    await new Promise(resolve => setTimeout(resolve, 25));
+                }
+                await this.server.sendNotification(didChangeShaderVariantNotification, {
+                    shaderVariant,
+                });
+                if (symbolUri) {
+                    await this.requestDocumentSymbol(symbolUri);
+                }
+            })
+            .catch(error => {
+                console.warn("Failed to send shader variant notification", error);
+            });
+    }
+    private getEffectiveDefinesForVariant(variant: ShaderVariant): { [key: string]: string } {
+        const groups = this.groupCache.get(variant.uri.path);
+        if (groups) {
+            for (const group of groups) {
+                for (const perm of group.permutationList.permutations) {
+                    if (perm.variant === variant) {
+                        const fullDefines: { [key: string]: string } = {};
+                        for (const d of group.commonDefineList.defines) {
+                            fullDefines[d.label] = d.value;
+                        }
+                        for (const d of perm.deltaDefines) {
+                            fullDefines[d.label] = d.value;
+                        }
+                        return fullDefines;
+                    }
+                }
+            }
+        }
+        return Object.fromEntries(variant.defines.defines.map(d => [d.label, d.value]));
+    }
     private notifyVariantChanged() {
         function capitalizeFirstLetter(str: string): string {
             return str.charAt(0).toUpperCase() + str.slice(1);
@@ -683,64 +937,50 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         // Notify server of change.
         let fileActiveVariant = this.getActiveVariant();
         if (fileActiveVariant) {
+            const activeVariant = fileActiveVariant;
             // Open document to get language ID.
             // This does not open the document in the editor, only internally.
-            vscode.workspace.openTextDocument(fileActiveVariant.uri).then(doc => {
-                this.server.sendNotification(didChangeShaderVariantNotification, {
-                    // Need this check again here because its async
-                    shaderVariant: fileActiveVariant ? shaderVariantToSerialized(
-                        this.server.uriAsString(fileActiveVariant.uri), 
+            vscode.workspace.openTextDocument(activeVariant.uri).then(doc => {
+                this.sendShaderVariantNotification(
+                    shaderVariantToSerialized(
+                        this.server.uriAsString(activeVariant.uri), 
                         capitalizeFirstLetter(doc.languageId), // Server expect it with capitalized first letter.
-                        fileActiveVariant
-                    ) : null,
-                });
+                        activeVariant,
+                        this.getEffectiveDefinesForVariant(activeVariant)
+                    ),
+                    activeVariant.uri,
+                );
             });
         } else {
-            this.server.sendNotification(didChangeShaderVariantNotification, {
-                shaderVariant: null,
-            });
+            this.sendShaderVariantNotification(null);
         }
         
     }
-    private requestDocumentSymbol(uri: vscode.Uri) {
+    private requestDocumentSymbol(uri: vscode.Uri): Promise<void> {
         // TODO: should request inlay hint aswell.
-        // This one seems to get symbol from cache without requesting the server...
-        //vscode.commands.executeCommand("vscode.executeDocumentSymbolProvider", file.uri);
-        // This one works, but result is not intercepted by vscode & updated...
-        //this.client.sendRequest(DocumentSymbolRequest.type, {
-        //    textDocument: {
-        //        uri: this.client.code2ProtocolConverter.asUri(file.uri),
-        //    }
-        //});
-        // We have to rely on a dirty hack instead.
-        // Need to check this does not break anything
-        // Dirty hack to trigger document symbol update
-        // Ideally, it should retrigger dependencies aswell.
-        // See https://github.com/microsoft/vscode/issues/108722 (Old one https://github.com/microsoft/vscode/issues/71454)
+        // Previously this used a dirty edit hack (delete + re-insert the last char of the
+        // first non-empty line) to force VS Code to re-request document symbols — but that
+        // hack marks the file as dirty.  Instead we send a direct LSP documentSymbol request
+        // (which the server handles correctly) and update only the extension's internal
+        // entry-point cache.  VS Code's built-in outline / breadcrumbs stay stale until the
+        // next user edit, but the extension's own features (goto entry point, decorations)
+        // work immediately.
+        // See https://github.com/microsoft/vscode/issues/108722
 
-        // Only trigger it if requested by user as it may be a bit invasive.
         let updateSymbolsOnVariantUpdate = vscode.workspace.getConfiguration("shader-validator").get<boolean>("updateSymbolsOnVariantUpdate");
         if (updateSymbolsOnVariantUpdate) {
-            let visibleEditor = vscode.window.visibleTextEditors.find(e => e.document.uri.path === uri.path);
-            if (visibleEditor) {
-                let editor = visibleEditor;
-                editor.edit(editBuilder => {
-                    for (let iLine = 0; iLine < editor.document.lineCount; iLine++) {
-                        // Find first non-empty line to avoid crashing on empty line with negative position.
-                        let line = editor.document.lineAt(iLine);
-                        if (line.text.length > 0) {
-                            const text = line.text;
-                            const c = line.range.end.character;
-                            // Remove last character of first line and add it back.
-                            editBuilder.delete(new vscode.Range(iLine, c-1, iLine, c));
-                            editBuilder.insert(new vscode.Position(iLine, c), text[c-1]);
-                            break;
-                        }
+            return this.withShaderAnalysisProgress(uri, async () => {
+                const result = await this.server.sendRequest(DocumentSymbolRequest.type, {
+                    textDocument: {
+                        uri: this.server.uriAsString(uri),
                     }
-                    // All empty lines means no symbols !
                 });
-            }
+                if (result) {
+                    this.onDocumentSymbols(uri, result as vscode.DocumentSymbol[]);
+                }
+            });
         }
+        return Promise.resolve();
     }
     private updateDependency(file: ShaderVariantFile) {
         // When editing variant, might need to send it if holding an active one.
@@ -897,6 +1137,56 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             item.tooltip = `Include path ${resolvedIncludePath}`;
             item.contextValue = element.kind;
             return item;
+        } else if (element.kind === 'varyingDefineList') {
+            const allVaryingKeys = element.defines.map(d => d.label);
+            const selection = this.varyingSelection.get(element.selectionKey);
+            const allSelected = selection !== undefined && allVaryingKeys.every(k => selection.has(k));
+
+            let label = 'varying defines';
+            let tooltip = 'Define keys that differ across permutations. Select one value per key to target a specific permutation.';
+
+            if (selection && selection.size > 0) {
+                const ownerGroup = this.lookupEntryGroup(element.selectionKey);
+                if (ownerGroup) {
+                    const match = allSelected ? this.findMatchingPermutation(ownerGroup, selection) : null;
+                    if (match !== null) {
+                        label = `varying defines (#${match.index})`;
+                        tooltip = `Varying define selection matches permutation #${match.index}.`;
+                    } else if (allSelected) {
+                        label = 'varying defines (#invalid)';
+                        tooltip = 'No permutation matches this combination of varying define values.';
+                    }
+                }
+            }
+
+            const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Expanded);
+            item.description = `${element.defines.length}`;
+            item.tooltip = tooltip;
+            item.iconPath = new vscode.ThemeIcon('symbol-boolean');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'varyingDefine') {
+            // Collapsible "inline dropdown": description shows the currently-selected value,
+            // children are the value checkboxes. Works for any number of values.
+            const selection = this.varyingSelection.get(element.selectionKey);
+            const current = selection?.get(element.label);
+            const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.Collapsed);
+            item.description = current ?? '';
+            item.tooltip = `Varying define "${element.label}" — ${element.values.length} value${element.values.length === 1 ? '' : 's'}.${current ? ` Currently: ${current}` : ''}`;
+            item.iconPath = new vscode.ThemeIcon('symbol-key');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'varyingDefineValue') {
+            const selection = this.varyingSelection.get(element.selectionKey);
+            const isChecked = selection !== undefined && selection.get(element.defineKey) === element.label;
+
+            const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+            item.checkboxState = isChecked
+                ? vscode.TreeItemCheckboxState.Checked
+                : vscode.TreeItemCheckboxState.Unchecked;
+            item.tooltip = `Set "${element.defineKey}" to "${element.label}".`;
+            item.contextValue = element.kind;
+            return item;
         } else {
             console.error("Unimplemented kind: ", element);
             return undefined!; // unreachable
@@ -909,11 +1199,29 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
         switch (element.kind) {
             case 'file': return this.getEntryGroups(element);
-            case 'entryGroup': return [element.stageNode, element.commonDefineList, element.includeList, element.permutationList];
+            case 'entryGroup': {
+                const children: ShaderVariantNode[] = [
+                    element.stageNode,
+                    element.commonDefineList,
+                    element.includeList,
+                    element.permutationList,
+                ];
+                // Insert varyingDefineList after commonDefineList when non-empty.
+                if (element.varyingDefineList.defines.length > 0) {
+                    children.splice(2, 0, element.varyingDefineList);
+                }
+                return children;
+            }
             case 'commonDefineList': return element.defines;
             case 'groupIncludeList': return element.includes;
             case 'permutationList': return element.permutations;
             case 'permutation': return element.deltaDefines;
+            case 'varyingDefineList': {
+                // One collapsible node per varying key — expands to show value checkboxes inline.
+                return element.defines;
+            }
+            case 'varyingDefine': return element.values;
+            case 'varyingDefineValue': return [];
             // Leaf & legacy kinds have no children in the grouped view.
             default: return [];
         }
@@ -925,35 +1233,132 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (cached) {
             return cached;
         }
-        let groups = groupVariantsByEntryPoint(file.variants).map((group): ShaderEntryGroup => ({
-            kind: 'entryGroup',
-            uri: file.uri,
-            name: group.name,
-            permutationCount: group.permutations.length,
-            stageNode: { kind: 'groupStage', stage: group.stage },
-            commonDefineList: {
-                kind: 'commonDefineList',
-                defines: group.commonDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
-            },
-            includeList: {
-                kind: 'groupIncludeList',
-                includes: group.includes.map((i): ShaderReadonlyInclude => ({ kind: 'readonlyInclude', include: i })),
-            },
-            permutationList: {
-                kind: 'permutationList',
-                permutations: group.permutations.map((p, index): ShaderPermutation => ({
-                    kind: 'permutation',
-                    variant: p.variant,
-                    label: `#${index}`,
-                    deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
-                })),
-            },
-        }));
+        let groups = groupVariantsByEntryPoint(file.variants).map((group): ShaderEntryGroup => {
+            const selectionKey = `${file.uri.path}::${group.name}`;
+            // Seed varyingSelection from the active permutation (only on first build).
+            this.initVaryingSelectionFromGroup(group, selectionKey);
+            const varyingDefineList = buildVaryingDefines(group, selectionKey)
+                || { kind: 'varyingDefineList' as const, selectionKey, defines: [] };
+
+            return {
+                kind: 'entryGroup',
+                uri: file.uri,
+                name: group.name,
+                permutationCount: group.permutations.length,
+                stageNode: { kind: 'groupStage', stage: group.stage },
+                commonDefineList: {
+                    kind: 'commonDefineList',
+                    defines: group.commonDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+                },
+                varyingDefineList,
+                includeList: {
+                    kind: 'groupIncludeList',
+                    includes: group.includes.map((i): ShaderReadonlyInclude => ({ kind: 'readonlyInclude', include: i })),
+                },
+                permutationList: {
+                    kind: 'permutationList',
+                    permutations: group.permutations.map((p, index): ShaderPermutation => ({
+                        kind: 'permutation',
+                        variant: p.variant,
+                        label: `#${index}`,
+                        deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+                    })),
+                },
+            };
+        });
         this.groupCache.set(file.uri.path, groups);
         return groups;
     }
     private invalidateGroups(filePath: string) {
         this.groupCache.delete(filePath);
+        this.varyingSelection.clear();
+    }
+    // Seed varyingSelection from the active permutation in a group (used on first group build).
+    private initVaryingSelectionFromGroup(group: EntryGroupData, selectionKey: string): void {
+        if (this.varyingSelection.has(selectionKey)) { return; }
+        const activePerm = group.permutations.find(p => p.variant.isActive);
+        if (activePerm && activePerm.deltaDefines.length > 0) {
+            const sel = new Map<string, string>();
+            for (const d of activePerm.deltaDefines) { sel.set(d.label, d.value); }
+            this.varyingSelection.set(selectionKey, sel);
+        }
+    }
+    // Force-update varyingSelection to match a variant's delta defines (called on permutation check).
+    private syncVaryingSelectionFromVariant(variant: ShaderVariant): void {
+        const groups = this.groupCache.get(variant.uri.path);
+        if (!groups) { return; }
+        for (const group of groups) {
+            for (const perm of group.permutationList.permutations) {
+                if (perm.variant === variant) {
+                    const selectionKey = `${variant.uri.path}::${group.name}`;
+                    const sel = new Map<string, string>();
+                    for (const d of perm.deltaDefines) { sel.set(d.label, d.value); }
+                    this.varyingSelection.set(selectionKey, sel);
+                    return;
+                }
+            }
+        }
+    }
+    // Find whether the current varyingSelection matches a permutation in the given group.
+    // Returns { index, variant } on exact match, or null for incomplete / invalid combinations.
+    private findMatchingPermutation(
+        group: ShaderEntryGroup,
+        selection: Map<string, string>,
+    ): { index: number; variant: ShaderVariant; } | null {
+        for (let i = 0; i < group.permutationList.permutations.length; i++) {
+            const perm = group.permutationList.permutations[i];
+            // A match requires every selected (key,value) to be present in the permutation's delta,
+            // AND the delta must contain only keys in the selection (exact set equality).
+            const delta = new Map(perm.deltaDefines.map(d => [d.label, d.value]));
+            if (delta.size !== selection.size) { continue; }
+            let matches = true;
+            for (const [key, value] of selection) {
+                if (delta.get(key) !== value) { matches = false; break; }
+            }
+            if (matches) { return { index: i, variant: perm.variant }; }
+        }
+        return null;
+    }
+    // Resolve a selectionKey back to the owning ShaderEntryGroup (if cached).
+    private lookupEntryGroup(selectionKey: string): ShaderEntryGroup | undefined {
+        const idx = selectionKey.lastIndexOf('::');
+        if (idx < 0) { return undefined; }
+        const filePath = selectionKey.substring(0, idx);
+        const groupName = selectionKey.substring(idx + 2);
+        const groups = this.groupCache.get(filePath);
+        return groups?.find(g => g.name === groupName);
+    }
+    // Send the current varying-selection defines (common + selected varying) to the server so it
+    // re-parses with them — even when the combination doesn't match any real permutation.
+    private notifyVaryingSelection(selectionKey: string, sel: Map<string, string>): void {
+        const ownerGroup = this.lookupEntryGroup(selectionKey);
+        if (!ownerGroup) { return; }
+        // Merge common defines + selected varying defines (varying overrides common on conflict).
+        const fullDefines: { [key: string]: string } = {};
+        for (const d of ownerGroup.commonDefineList.defines) {
+            fullDefines[d.label] = d.value;
+        }
+        for (const [key, value] of sel) {
+            fullDefines[key] = value;
+        }
+        const includes = ownerGroup.includeList.includes.map(i => i.include);
+        vscode.workspace.openTextDocument(ownerGroup.uri).then(doc => {
+            const shadeLang = doc.languageId.charAt(0).toUpperCase() + doc.languageId.slice(1);
+            this.sendShaderVariantNotification({
+                    url: this.server.uriAsString(ownerGroup.uri),
+                    shadingLanguage: shadeLang,
+                    entryPoint: ownerGroup.name,
+                    stage: ShaderStage[ownerGroup.stageNode.stage],
+                    defines: fullDefines,
+                    includes,
+                }, ownerGroup.uri);
+        });
+    }
+    // Clear the varying selection for this entry group and tell the server there is no active variant.
+    private notifyVaryingClear(selectionKey: string): void {
+        const ownerGroup = this.lookupEntryGroup(selectionKey);
+        if (!ownerGroup) { return; }
+        this.sendShaderVariantNotification(null, ownerGroup.uri);
     }
     // Required for TreeView.reveal (used to auto-reveal a file node when its editor becomes active).
     public getParent(element: ShaderVariantNode): ShaderVariantNode | undefined {
@@ -965,7 +1370,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
         for (let groups of this.groupCache.values()) {
             for (let group of groups) {
-                if (element === group.stageNode || element === group.commonDefineList || element === group.includeList || element === group.permutationList) {
+                if (element === group.stageNode || element === group.commonDefineList || element === group.includeList || element === group.permutationList || element === group.varyingDefineList) {
                     return group;
                 }
                 if (group.permutationList.permutations.some(p => p === element)) {
@@ -981,6 +1386,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 }
                 if (group.includeList.includes.some(i => i === element)) {
                     return group.includeList;
+                }
+                // varyingDefine and varyingDefineValue
+                for (const vd of group.varyingDefineList.defines) {
+                    if (element === vd) {
+                        return group.varyingDefineList;
+                    }
+                    if (vd.values.some(v => v === element)) {
+                        return vd;
+                    }
                 }
             }
         }
@@ -1053,14 +1467,6 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
         }
     }
-    // Auto-import variants for a shader document from the shader-validator.variantFolder setting.
-    // Guards language & scheme then runs the async import as fire-and-forget.
-    private tryAutoImportVariants(document: vscode.TextDocument): void {
-        if (document.uri.scheme !== 'file' || !ShaderLanguageClient.isEnabledLangId(document.languageId)) {
-            return;
-        }
-        this.autoImportVariants(document.uri).catch(e => console.warn("Shader variant auto-import failed", e));
-    }
     // Recursively collect every *.json file under a folder, caching the listing per resolved root.
     // The folder is a tree of engine-dumped JSON configs (e.g. UE ShaderDebugInfo), so nested
     // directories are walked.
@@ -1095,8 +1501,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // entry points x all permutations, across nested directories) and merge them into one
     // de-duplicated variant list attached to uri. Returns null when no folder is configured or no
     // matching config is found. Logs & skips unreadable/invalid files; never throws. `forceRescan`
-    // rebuilds the cached file listing (used on open so freshly dumped files are seen); switching
-    // variants reuses the cache for speed.
+    // rebuilds the cached file listing so explicit Refresh / Add File picks up freshly dumped JSONs.
     private async loadVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = false): Promise<ShaderVariant[] | null> {
         if (uri.scheme !== 'file') {
             return null;
@@ -1145,14 +1550,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         let merged = mergeVariantConfigs(uri, configs, openedBaseName);
         return merged.length > 0 ? merged : null;
     }
-    // Load the config(s) for a shader and replace its variants in the tree. The config is the
-    // source of truth: re-opening the shader re-syncs the tree. Rescans the folder so freshly
-    // dumped permutations are picked up.
-    private async autoImportVariants(uri: vscode.Uri): Promise<void> {
-        let variants = await this.loadVariantsFromConfig(uri, true);
+    // Load the config(s) for a shader and replace its variants in the tree. Returns true when JSON
+    // configs were found and applied. Used only by explicit user actions (Refresh / Add File).
+    private async importVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = true): Promise<boolean> {
+        let variants = await this.loadVariantsFromConfig(uri, forceRescan);
         if (variants) {
             this.applyImportedVariants(uri, variants);
+            return true;
         }
+        return false;
     }
     // Replace the variants of a file with imported ones, only if they actually differ (avoids
     // churn & dirty edits when re-opening). Preserves the active selection when a matching
@@ -1190,39 +1596,51 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             this.revealActiveEditorFile(vscode.window.activeTextEditor);
         }
     }
-    // Activate the clicked variant, re-reading its config from disk first
-    // (auto-refresh-config-before-switch). This keeps the switch in sync with the latest config
-    // without a file watcher. When no variant folder is configured, loadVariantsFromConfig returns
-    // null and this behaves like a plain activation.
+    // Activate the clicked variant.  No longer re-reads JSON configs from disk on every toggle —
+    // use the manual Refresh button (shader-validator.refreshVariants) to pull in config changes.
     private async activateVariantWithRefresh(clicked: ShaderVariant): Promise<void> {
         let signature = variantSignature(clicked);
-        let reloaded = await this.loadVariantsFromConfig(clicked.uri);
         let file = this.files.get(clicked.uri.path);
-        if (reloaded && file) {
-            let changed = JSON.stringify(file.variants.map(variantSignature)) !== JSON.stringify(reloaded.map(variantSignature));
-            if (changed) {
-                file.variants = reloaded;
-                this.invalidateGroups(file.uri.path);
-                this.refresh(file, file); // re-render the refreshed variant set
-            }
-        }
-        // The clicked node may have been replaced by the refresh: re-find it by signature.
+        // The clicked node may have been removed by an external edit; re-find by signature.
         let toActivate = file ? file.variants.find(v => variantSignature(v) === signature) : clicked;
         if (file && !toActivate) {
-            vscode.window.showWarningMessage(`The selected shader variant no longer exists in the refreshed config for ${vscode.workspace.asRelativePath(clicked.uri)}.`);
+            vscode.window.showWarningMessage(`The selected shader variant no longer exists for ${vscode.workspace.asRelativePath(clicked.uri)}. Use the Refresh button to re-import configs.`);
         }
-        // Keep a single active variant across all files.
+        // Phase 1: clear the previous active variant(s) first so switching A -> B behaves like a
+        // manual uncheck followed by a check, which the server handles more reliably.
+        let hadActiveVariant = false;
         for (let [, otherFile] of this.files) {
             let needRefresh = false;
             for (let other of otherFile.variants) {
-                let shouldBeActive = (toActivate !== undefined && other === toActivate);
-                if (other.isActive !== shouldBeActive) {
-                    other.isActive = shouldBeActive;
+                if (other.isActive) {
+                    hadActiveVariant = true;
+                    other.isActive = false;
                     needRefresh = true;
                 }
             }
             if (needRefresh) {
                 this.refresh(otherFile, otherFile);
+            }
+        }
+        if (hadActiveVariant) {
+            this.sendShaderVariantNotification(null, toActivate?.uri ?? clicked.uri, true);
+            await this.shaderVariantNotificationQueue;
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        // Phase 2: activate the requested variant.
+        if (toActivate) {
+            for (let [, otherFile] of this.files) {
+                let needRefresh = false;
+                for (let other of otherFile.variants) {
+                    let shouldBeActive = other === toActivate;
+                    if (other.isActive !== shouldBeActive) {
+                        other.isActive = shouldBeActive;
+                        needRefresh = true;
+                    }
+                }
+                if (needRefresh) {
+                    this.refresh(otherFile, otherFile);
+                }
             }
         }
     }

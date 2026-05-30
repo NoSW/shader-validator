@@ -55,7 +55,7 @@ function getConfigurationAsString(): string {
     for (const [key, value] of Object.entries(config)) {
         configObject[key] = value;
     }
-    return JSON.stringify(configObject);
+    return JSON.stringify(resolveConfigurationPathVariables(configObject));
 }
 
 export function resolveVSCodeVariables(content: string) : string {
@@ -79,6 +79,26 @@ export function resolveVSCodeVariables(content: string) : string {
         // All others variable are relative to currently opened file and will be a pain to implement so ignoring them for now.
         return "";
     });
+}
+function resolveConfigurationPathVariables(config: { [key: string]: any }): { [key: string]: any } {
+    const resolvedConfig: { [key: string]: any } = { ...config };
+    if (Array.isArray(config["includes"])) {
+        resolvedConfig["includes"] = config["includes"].map((include: string) => {
+            return typeof include === "string" ? resolveVSCodeVariables(include) : include;
+        });
+    }
+    if (typeof config["serverPath"] === "string") {
+        resolvedConfig["serverPath"] = resolveVSCodeVariables(config["serverPath"]);
+    }
+    if (config["pathRemapping"] && typeof config["pathRemapping"] === "object") {
+        resolvedConfig["pathRemapping"] = { ...config["pathRemapping"] };
+        Object.entries(config["pathRemapping"]).forEach(([key, value]) => {
+            if (typeof value === "string") {
+                resolvedConfig["pathRemapping"][key] = resolveVSCodeVariables(value);
+            }
+        });
+    }
+    return resolvedConfig;
 }
 function getChannelName(): string {
     return 'Shader language Server';
@@ -234,15 +254,7 @@ function getMiddleware() : Middleware {
                 let result = await next(params, token);
                 console.debug("initial configuration", result);
                 let resultArray = result as any[];
-                let config = resultArray[0];
-                // Only solve them for path variables.
-                config["includes"] = config["includes"].map((include: string) => {
-                    return resolveVSCodeVariables(include);
-                });
-                config["serverPath"] = resolveVSCodeVariables(config["serverPath"]);
-                Object.entries(config["pathRemapping"]).forEach(([key, value]) => {
-                    config["pathRemapping"][key] = resolveVSCodeVariables(value as string);
-                });
+                let config = resolveConfigurationPathVariables(resultArray[0]);
                 console.debug("resolved configuration", config);
                 return [config];
             }
