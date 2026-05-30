@@ -106,7 +106,37 @@ export type ShaderEntryPoint = {
     range: vscode.Range,
 };
 
-export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVariantDefineList | ShaderVariantIncludeList | ShaderVariantDefine | ShaderVariantInclude | ShaderVariantStage;
+// --- Grouped display nodes (computed from ShaderVariantFile.variants; not persisted) ---
+// The panel groups a file's permutations by entry point. Each entryGroup shows the shared stage,
+// the defines common to ALL its permutations, the shared includes, and a 'defines' list with one
+// node per permutation. The active checkbox lives on the permutation node, which shows only the
+// defines that differ from the group's common defines. These nodes use contextValues that do not
+// match any package.json menu 'when' clause, so they carry no manual add/edit/delete inline icons.
+export type ShaderReadonlyDefine = { kind: 'readonlyDefine', label: string, value: string };
+export type ShaderReadonlyInclude = { kind: 'readonlyInclude', include: string };
+export type ShaderGroupStage = { kind: 'groupStage', stage: ShaderStage };
+export type ShaderCommonDefineList = { kind: 'commonDefineList', defines: ShaderReadonlyDefine[] };
+export type ShaderGroupIncludeList = { kind: 'groupIncludeList', includes: ShaderReadonlyInclude[] };
+export type ShaderPermutation = {
+    kind: 'permutation',
+    variant: ShaderVariant,             // underlying full permutation (drives active state & server notify)
+    label: string,
+    deltaDefines: ShaderReadonlyDefine[],
+};
+export type ShaderPermutationList = { kind: 'permutationList', permutations: ShaderPermutation[] };
+export type ShaderEntryGroup = {
+    kind: 'entryGroup',
+    uri: vscode.Uri,
+    name: string,
+    permutationCount: number,
+    stageNode: ShaderGroupStage,
+    commonDefineList: ShaderCommonDefineList,
+    includeList: ShaderGroupIncludeList,
+    permutationList: ShaderPermutationList,
+};
+
+export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVariantDefineList | ShaderVariantIncludeList | ShaderVariantDefine | ShaderVariantInclude | ShaderVariantStage
+    | ShaderEntryGroup | ShaderGroupStage | ShaderCommonDefineList | ShaderGroupIncludeList | ShaderPermutationList | ShaderPermutation | ShaderReadonlyDefine | ShaderReadonlyInclude;
 
 // Configuration file schema used by the shader-validator.variantFolder import feature.
 // A config describes the variants of one shader (single-file form) or several (multi-file form).
@@ -119,6 +149,10 @@ export interface ShaderVariantConfigVariant {
 export interface ShaderVariantConfigFile {
     file?: string,
     language?: string,
+    // Common defines/includes applied to every variant of this file. A variant's own defines/
+    // includes take precedence on conflict. Lets a config factor out macros shared by all variants.
+    defines?: { [key: string]: string | number },
+    includes?: string[],
     variants: ShaderVariantConfigVariant[],
 }
 export interface ShaderVariantConfigMultiple {
@@ -193,16 +227,33 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
     if (!fileConfig || !Array.isArray(fileConfig.variants)) {
         return [];
     }
+    // File-level common defines/includes are applied to every variant; a variant's own values
+    // take precedence over the common ones on key (define) or path (include) conflict.
+    let commonDefines = fileConfig.defines || {};
+    let commonIncludes = fileConfig.includes || [];
     return fileConfig.variants.map((variant: ShaderVariantConfigVariant): ShaderVariant => {
-        let defines: ShaderVariantDefine[] = [];
+        // Merge defines: common first, then the variant's own (variant overrides on key conflict).
+        let mergedDefines = new Map<string, string>();
+        for (let [label, value] of Object.entries(commonDefines)) {
+            mergedDefines.set(label, String(value));
+        }
         if (variant.defines) {
             for (let [label, value] of Object.entries(variant.defines)) {
-                defines.push({ kind: 'define', label: label, value: String(value) });
+                mergedDefines.set(label, String(value));
             }
         }
-        let includes: ShaderVariantInclude[] = (variant.includes || []).map((include: string): ShaderVariantInclude => {
-            return { kind: 'include', include: include };
+        let defines: ShaderVariantDefine[] = Array.from(mergedDefines, ([label, value]): ShaderVariantDefine => {
+            return { kind: 'define', label: label, value: value };
         });
+        // Merge includes: common then variant, de-duplicated while preserving order.
+        let seenIncludes = new Set<string>();
+        let includes: ShaderVariantInclude[] = [];
+        for (let include of [...commonIncludes, ...(variant.includes || [])]) {
+            if (!seenIncludes.has(include)) {
+                seenIncludes.add(include);
+                includes.push({ kind: 'include', include: include });
+            }
+        }
         return {
             kind: 'variant',
             uri: uri,
@@ -227,6 +278,85 @@ export function variantSignature(variant: ShaderVariant): string {
     });
 }
 
+// Merge several parsed configs into one de-duplicated variant list for the opened shader. Used to
+// fold the many single-permutation JSON files an engine dumps (one per entry point x permutation)
+// into a single set. Single-file configs whose 'file' targets a different shader are skipped;
+// multi-file configs are matched by openedBaseName inside configToVariants. Identical permutations
+// (same variantSignature) are collapsed.
+export function mergeVariantConfigs(uri: vscode.Uri, configs: ShaderVariantConfig[], openedBaseName: string): ShaderVariant[] {
+    let merged: ShaderVariant[] = [];
+    let seen = new Set<string>();
+    for (let config of configs) {
+        let isMultiFile = Array.isArray((config as ShaderVariantConfigMultiple).files);
+        if (!isMultiFile) {
+            let file = (config as ShaderVariantConfigFile).file;
+            if (file && getBaseName(file).toLowerCase() !== openedBaseName.toLowerCase()) {
+                continue; // single-file config describing a different shader
+            }
+        }
+        for (let variant of configToVariants(uri, config, openedBaseName)) {
+            let signature = variantSignature(variant);
+            if (!seen.has(signature)) {
+                seen.add(signature);
+                merged.push(variant);
+            }
+        }
+    }
+    return merged;
+}
+
+// Plain (testable) grouping of a file's permutations by entry point. Permutations sharing an entry
+// point + stage are grouped; `commonDefines` are the (label,value) pairs identical across ALL of
+// them, `includes` the includes shared by all, and each permutation's `deltaDefines` are the defines
+// that differ from the common set. First-seen order is preserved.
+export type EntryGroupData = {
+    name: string,
+    stage: ShaderStage,
+    commonDefines: { label: string, value: string }[],
+    includes: string[],
+    permutations: { variant: ShaderVariant, deltaDefines: { label: string, value: string }[] }[],
+};
+export function groupVariantsByEntryPoint(variants: ShaderVariant[]): EntryGroupData[] {
+    let order: string[] = [];
+    let groups = new Map<string, ShaderVariant[]>();
+    for (let variant of variants) {
+        let key = `${variant.name} ${variant.stage.stage}`;
+        let bucket = groups.get(key);
+        if (!bucket) { bucket = []; groups.set(key, bucket); order.push(key); }
+        bucket.push(variant);
+    }
+    return order.map((key): EntryGroupData => {
+        let permutations = groups.get(key)!;
+        // Common defines: label present with identical value in every permutation.
+        let common = new Map<string, string>(permutations[0].defines.defines.map(d => [d.label, d.value]));
+        for (let i = 1; i < permutations.length; i++) {
+            let m = new Map(permutations[i].defines.defines.map(d => [d.label, d.value]));
+            for (let [label, value] of [...common]) {
+                if (m.get(label) !== value) { common.delete(label); }
+            }
+        }
+        // Common includes: present in every permutation.
+        let commonIncludes: Set<string> | null = null;
+        for (let permutation of permutations) {
+            let set = new Set(permutation.includes.includes.map(i => i.include));
+            if (commonIncludes === null) { commonIncludes = set; }
+            else { for (let include of [...commonIncludes]) { if (!set.has(include)) { commonIncludes.delete(include); } } }
+        }
+        return {
+            name: permutations[0].name,
+            stage: permutations[0].stage.stage,
+            commonDefines: [...common].map(([label, value]) => ({ label, value })),
+            includes: commonIncludes ? [...commonIncludes] : [],
+            permutations: permutations.map(variant => ({
+                variant: variant,
+                deltaDefines: variant.defines.defines
+                    .filter(d => common.get(d.label) !== d.value)
+                    .map(d => ({ label: d.label, value: d.value })),
+            })),
+        };
+    });
+}
+
 const shaderVariantTreeKey : string = 'shader-validator.shader-variant-tree-key';
 
 export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<ShaderVariantNode> {
@@ -242,6 +372,13 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private workspaceState: vscode.Memento;
     private shaderEntryPointList: Map<string, ShaderEntryPoint[]>;
     private asyncGoToShaderEntryPoint: Map<vscode.Uri, string>;
+    // Cached recursive listing of *.json files under the resolved variantFolder (rebuilt on open &
+    // when the setting changes; reused while switching variants to avoid re-walking the tree).
+    private jsonFileCache: { root: string, files: vscode.Uri[] } | null = null;
+    // Cached per-file grouped projection (entry-point groups) shown in the panel. Stable object
+    // identity preserves tree expansion/checkbox state; invalidated only when a file's variants
+    // change (membership/defines), not on a plain active toggle. Built lazily by getChildren.
+    private groupCache: Map<string, ShaderEntryGroup[]> = new Map();
 
     private load() {
         let variants : ShaderVariantFile[] = this.workspaceState.get<ShaderVariantFile[]>(shaderVariantTreeKey, []);
@@ -272,8 +409,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         });
         this.asyncGoToShaderEntryPoint = new Map;
         this.tree.onDidChangeCheckboxState(async (e: vscode.TreeCheckboxChangeEvent<ShaderVariantNode>) => {
-            for (let [variant, checkboxState] of e.items) {
-                if (variant.kind === 'variant') {
+            for (let [node, checkboxState] of e.items) {
+                if (node.kind === 'permutation') {
+                    let variant = node.variant;
                     if (checkboxState === vscode.TreeItemCheckboxState.Checked) {
                         await this.activateVariantWithRefresh(variant);
                     } else {
@@ -399,6 +537,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     // Remove the old key and set the new key
                     this.files.delete(oldPath);
                     this.files.set(newPath, file);
+                    this.invalidateGroups(oldPath);
+                    this.invalidateGroups(newPath);
                 }
                 // Also update entry point and async maps
                 const entryPoints = this.shaderEntryPointList.get(oldPath);
@@ -415,6 +555,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 this.asyncGoToShaderEntryPoint;
             }
         }));
+        // Auto-reveal the panel node for the active shader when switching/opening editors.
+        context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(editor => this.revealActiveEditorFile(editor)));
+        this.revealActiveEditorFile(vscode.window.activeTextEditor);
         this.onServerStart();
     }
     onServerStart() {
@@ -688,6 +831,72 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             item.iconPath = new vscode.ThemeIcon('code');
             item.contextValue = element.kind;
             return item;
+        } else if (element.kind === 'entryGroup') {
+            let item = new vscode.TreeItem(element.name, vscode.TreeItemCollapsibleState.Collapsed);
+            item.command = {
+                title: "Go to entry point",
+                command: 'shader-validator.gotoShaderEntryPoint',
+                arguments: [element.uri, element.name]
+            };
+            item.description = `${element.permutationCount}`;
+            item.tooltip = `Entry point ${element.name} (${element.permutationCount} permutation${element.permutationCount === 1 ? '' : 's'})`;
+            item.iconPath = new vscode.ThemeIcon('symbol-function');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'groupStage') {
+            let item = new vscode.TreeItem("stage", vscode.TreeItemCollapsibleState.None);
+            item.description = ShaderStage[element.stage];
+            item.tooltip = "The shader stage shared by this entry point's permutations.";
+            item.iconPath = new vscode.ThemeIcon('code');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'commonDefineList') {
+            let item = new vscode.TreeItem("common defines", vscode.TreeItemCollapsibleState.Collapsed);
+            item.description = `${element.defines.length}`;
+            item.tooltip = "Defines shared by every permutation of this entry point.";
+            item.iconPath = new vscode.ThemeIcon('keyboard');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'groupIncludeList') {
+            let item = new vscode.TreeItem("includes", vscode.TreeItemCollapsibleState.Collapsed);
+            item.description = `${element.includes.length}`;
+            item.tooltip = "Includes shared by every permutation of this entry point.";
+            item.iconPath = new vscode.ThemeIcon('files');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'permutationList') {
+            let item = new vscode.TreeItem("defines", vscode.TreeItemCollapsibleState.Expanded);
+            item.description = `${element.permutations.length}`;
+            item.tooltip = "One entry per permutation; tick one to make it the active variant.";
+            item.iconPath = new vscode.ThemeIcon('versions');
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'permutation') {
+            let hasDelta = element.deltaDefines.length > 0;
+            let item = new vscode.TreeItem(element.label, hasDelta ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+            item.command = {
+                title: "Go to entry point",
+                command: 'shader-validator.gotoShaderEntryPoint',
+                arguments: [element.variant.uri, element.variant.name]
+            };
+            item.description = `[${element.deltaDefines.map(d => `${d.label}=${d.value}`).join(",")}]`;
+            item.tooltip = `Permutation of ${element.variant.name}. Tick to make it the active variant.`;
+            item.checkboxState = element.variant.isActive ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'readonlyDefine') {
+            let item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+            item.description = element.value;
+            item.tooltip = `Macro ${element.label} = ${element.value}`;
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'readonlyInclude') {
+            let resolvedIncludePath = resolveVSCodeVariables(element.include);
+            let item = new vscode.TreeItem(element.include, vscode.TreeItemCollapsibleState.None);
+            item.description = resolvedIncludePath;
+            item.tooltip = `Include path ${resolvedIncludePath}`;
+            item.contextValue = element.kind;
+            return item;
         } else {
             console.error("Unimplemented kind: ", element);
             return undefined!; // unreachable
@@ -695,28 +904,100 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     }
 
     public getChildren(element?: ShaderVariantNode): ShaderVariantNode[] | Thenable<ShaderVariantNode[]> {
-        if (element) {
-            if (element.kind === 'variant') {
-                return [element.stage, element.defines, element.includes];
-            } else if (element.kind === 'file') {
-                return element.variants;
-            } else if (element.kind === 'includeList') {
-                return element.includes;
-            } else if (element.kind === 'defineList') {
-                return element.defines;
-            } else if (element.kind === 'include') {
-                return [];
-            } else if (element.kind === 'define') {
-                return [];
-            } else if (element.kind === 'stage') {
-                return [];
-            } else {
-                console.error("Reached unreachable", element);
-                return undefined!; // unreachable
-            }
-        } else {
-            // Convert to array
+        if (!element) {
             return Array.from(this.files.values());
+        }
+        switch (element.kind) {
+            case 'file': return this.getEntryGroups(element);
+            case 'entryGroup': return [element.stageNode, element.commonDefineList, element.includeList, element.permutationList];
+            case 'commonDefineList': return element.defines;
+            case 'groupIncludeList': return element.includes;
+            case 'permutationList': return element.permutations;
+            case 'permutation': return element.deltaDefines;
+            // Leaf & legacy kinds have no children in the grouped view.
+            default: return [];
+        }
+    }
+    // Build (or reuse cached) entry-point groups for a file. Cached objects keep stable identity so
+    // tree expansion & checkbox state survive refreshes; invalidated on variant-set change.
+    private getEntryGroups(file: ShaderVariantFile): ShaderEntryGroup[] {
+        let cached = this.groupCache.get(file.uri.path);
+        if (cached) {
+            return cached;
+        }
+        let groups = groupVariantsByEntryPoint(file.variants).map((group): ShaderEntryGroup => ({
+            kind: 'entryGroup',
+            uri: file.uri,
+            name: group.name,
+            permutationCount: group.permutations.length,
+            stageNode: { kind: 'groupStage', stage: group.stage },
+            commonDefineList: {
+                kind: 'commonDefineList',
+                defines: group.commonDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+            },
+            includeList: {
+                kind: 'groupIncludeList',
+                includes: group.includes.map((i): ShaderReadonlyInclude => ({ kind: 'readonlyInclude', include: i })),
+            },
+            permutationList: {
+                kind: 'permutationList',
+                permutations: group.permutations.map((p, index): ShaderPermutation => ({
+                    kind: 'permutation',
+                    variant: p.variant,
+                    label: `#${index}`,
+                    deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+                })),
+            },
+        }));
+        this.groupCache.set(file.uri.path, groups);
+        return groups;
+    }
+    private invalidateGroups(filePath: string) {
+        this.groupCache.delete(filePath);
+    }
+    // Required for TreeView.reveal (used to auto-reveal a file node when its editor becomes active).
+    public getParent(element: ShaderVariantNode): ShaderVariantNode | undefined {
+        if (element.kind === 'file') {
+            return undefined;
+        }
+        if (element.kind === 'entryGroup') {
+            return this.files.get(element.uri.path);
+        }
+        for (let groups of this.groupCache.values()) {
+            for (let group of groups) {
+                if (element === group.stageNode || element === group.commonDefineList || element === group.includeList || element === group.permutationList) {
+                    return group;
+                }
+                if (group.permutationList.permutations.some(p => p === element)) {
+                    return group.permutationList;
+                }
+                for (let perm of group.permutationList.permutations) {
+                    if (perm.deltaDefines.some(d => d === element)) {
+                        return perm;
+                    }
+                }
+                if (group.commonDefineList.defines.some(d => d === element)) {
+                    return group.commonDefineList;
+                }
+                if (group.includeList.includes.some(i => i === element)) {
+                    return group.includeList;
+                }
+            }
+        }
+        return undefined;
+    }
+    // Reveal (and select, without stealing focus) the panel node for a file.
+    private revealFile(file: ShaderVariantFile) {
+        this.tree.reveal(file, { select: true, focus: false, expand: true }).then(undefined, () => {});
+    }
+    // If the given editor is a tracked shader file, reveal its node in the panel.
+    private revealActiveEditorFile(editor: vscode.TextEditor | undefined) {
+        if (!editor || editor.document.uri.scheme !== 'file') {
+            return;
+        }
+        let file = this.files.get(editor.document.uri.path);
+        if (file) {
+            this.revealFile(file);
         }
     }
 
@@ -753,9 +1034,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 variants: variant ? [variant] : []
             };
             this.files.set(uri.path, newFile);
+            this.invalidateGroups(uri.path);
             this.refresh(null, this.files.get(uri.path)!); // This has to be here
         } else if (variant) {
             file.variants.push(variant);
+            this.invalidateGroups(uri.path);
             this.refresh(null, file);
         }
     }
@@ -765,6 +1048,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             // We keep it if some variants where defied.
             if (file.variants.length === 0) {
                 this.files.delete(uri.path);
+                this.invalidateGroups(uri.path);
                 this.refreshAll();
             }
         }
@@ -777,11 +1061,43 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
         this.autoImportVariants(document.uri).catch(e => console.warn("Shader variant auto-import failed", e));
     }
-    // Look up a JSON config file named after the shader in the configured variant folder and, if
-    // found, return the variants it describes (attached to uri). Returns null when no folder is
-    // configured, no config file exists, or parsing fails (logged, never throws). Pure I/O: does
-    // not mutate state nor fire events.
-    private async loadVariantsFromConfig(uri: vscode.Uri): Promise<ShaderVariant[] | null> {
+    // Recursively collect every *.json file under a folder, caching the listing per resolved root.
+    // The folder is a tree of engine-dumped JSON configs (e.g. UE ShaderDebugInfo), so nested
+    // directories are walked.
+    private async collectJsonFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
+        if (this.jsonFileCache && this.jsonFileCache.root === folderUri.path) {
+            return this.jsonFileCache.files;
+        }
+        let files: vscode.Uri[] = [];
+        let stack: vscode.Uri[] = [folderUri];
+        const maxFiles = 200000; // safety bound against pathologically large trees
+        while (stack.length > 0 && files.length < maxFiles) {
+            let dir = stack.pop()!;
+            let entries: [string, vscode.FileType][];
+            try {
+                entries = await vscode.workspace.fs.readDirectory(dir);
+            } catch (e) {
+                continue; // unreadable / missing dir, skip
+            }
+            for (let [name, type] of entries) {
+                let child = vscode.Uri.joinPath(dir, name);
+                if (type & vscode.FileType.Directory) {
+                    stack.push(child);
+                } else if ((type & vscode.FileType.File) && name.toLowerCase().endsWith('.json')) {
+                    files.push(child);
+                }
+            }
+        }
+        this.jsonFileCache = { root: folderUri.path, files };
+        return files;
+    }
+    // Scan the configured variant folder for every JSON config describing the opened shader (all
+    // entry points x all permutations, across nested directories) and merge them into one
+    // de-duplicated variant list attached to uri. Returns null when no folder is configured or no
+    // matching config is found. Logs & skips unreadable/invalid files; never throws. `forceRescan`
+    // rebuilds the cached file listing (used on open so freshly dumped files are seen); switching
+    // variants reuses the cache for speed.
+    private async loadVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = false): Promise<ShaderVariant[] | null> {
         if (uri.scheme !== 'file') {
             return null;
         }
@@ -793,44 +1109,47 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (resolvedFolder.length === 0) {
             return null;
         }
-        // Compute candidate config file names from the opened shader file name (e.g. FXAAShader.usf).
-        let openedBaseName = getBaseName(uri.path);
-        let dotIndex = openedBaseName.lastIndexOf('.');
-        let stem = dotIndex > 0 ? openedBaseName.substring(0, dotIndex) : openedBaseName; // e.g. FXAAShader
-        let candidates = [`${stem}.variants.json`, `${stem}.json`];
         let folderUri = vscode.Uri.file(resolvedFolder);
+        if (forceRescan) {
+            this.jsonFileCache = null;
+        }
+        let jsonFiles = await this.collectJsonFiles(folderUri);
 
-        let configUri: vscode.Uri | null = null;
-        for (let candidate of candidates) {
-            let candidateUri = vscode.Uri.joinPath(folderUri, candidate);
+        // Pre-filter by file name so we only parse JSONs named after the opened shader (engines name
+        // each dump <ShaderName>.json / <ShaderName>_DebugCompile.json), avoiding parsing the tree.
+        let openedBaseName = getBaseName(uri.path);                 // e.g. FXAAShader.usf
+        let dotIndex = openedBaseName.lastIndexOf('.');
+        let stemLower = (dotIndex > 0 ? openedBaseName.substring(0, dotIndex) : openedBaseName).toLowerCase();
+        let configs: ShaderVariantConfig[] = [];
+        for (let fileUri of jsonFiles) {
+            let jsonName = getBaseName(fileUri.path).toLowerCase();
+            if (!jsonName.startsWith(stemLower)) {
+                continue;
+            }
+            let rest = jsonName.slice(stemLower.length);            // "" never (ends .json); ".json", "_debugcompile.json", ".variants.json"...
+            if (!(rest === '.json' || rest.startsWith('.') || rest.startsWith('_'))) {
+                continue; // e.g. fxaashaderhelper.json -> reject
+            }
             try {
-                await vscode.workspace.fs.stat(candidateUri);
-                configUri = candidateUri;
-                break;
+                let bytes = await vscode.workspace.fs.readFile(fileUri);
+                configs.push(parseShaderVariantConfig(new TextDecoder('utf-8').decode(bytes)));
             } catch (e) {
-                // Not found, try next candidate.
+                let message = `Failed to import shader variants from ${fileUri.fsPath}: ${e instanceof Error ? e.message : e}`;
+                console.warn(message);
+                this.server.log(message);
             }
         }
-        if (!configUri) {
-            return null; // No config file for this shader.
+        if (configs.length === 0) {
+            return null; // No config for this shader.
         }
-
-        try {
-            let bytes = await vscode.workspace.fs.readFile(configUri);
-            let text = new TextDecoder('utf-8').decode(bytes);
-            let config = parseShaderVariantConfig(text);
-            return configToVariants(uri, config, openedBaseName);
-        } catch (e) {
-            let message = `Failed to import shader variants from ${configUri.fsPath}: ${e instanceof Error ? e.message : e}`;
-            console.warn(message);
-            this.server.log(message);
-            return null;
-        }
+        let merged = mergeVariantConfigs(uri, configs, openedBaseName);
+        return merged.length > 0 ? merged : null;
     }
-    // Load the config for a shader and replace its variants in the tree. The config file is the
-    // source of truth: re-opening the shader re-syncs the tree to the file.
+    // Load the config(s) for a shader and replace its variants in the tree. The config is the
+    // source of truth: re-opening the shader re-syncs the tree. Rescans the folder so freshly
+    // dumped permutations are picked up.
     private async autoImportVariants(uri: vscode.Uri): Promise<void> {
-        let variants = await this.loadVariantsFromConfig(uri);
+        let variants = await this.loadVariantsFromConfig(uri, true);
         if (variants) {
             this.applyImportedVariants(uri, variants);
         }
@@ -860,10 +1179,16 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             file = { kind: 'file', uri: uri, variants: variants };
             this.files.set(uri.path, file);
         }
+        this.invalidateGroups(uri.path);
         this.save();
         this.onDidChangeTreeDataEmitter.fire();
         this.notifyVariantChanged();
         this.updateDecorations();
+        // If the freshly-imported file is the one in the active editor, reveal it (the import is
+        // async, so the open-triggered reveal may have run before the file existed in the panel).
+        if (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri.path === uri.path) {
+            this.revealActiveEditorFile(vscode.window.activeTextEditor);
+        }
     }
     // Activate the clicked variant, re-reading its config from disk first
     // (auto-refresh-config-before-switch). This keeps the switch in sync with the latest config
@@ -877,6 +1202,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             let changed = JSON.stringify(file.variants.map(variantSignature)) !== JSON.stringify(reloaded.map(variantSignature));
             if (changed) {
                 file.variants = reloaded;
+                this.invalidateGroups(file.uri.path);
                 this.refresh(file, file); // re-render the refreshed variant set
             }
         }
@@ -961,6 +1287,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                             includes:[]
                         },
                     });
+                    this.invalidateGroups(node.uri.path);
                     this.refresh(node, node);
                 }
             }
@@ -1059,6 +1386,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     public delete(node: ShaderVariantNode) {
         if (node.kind === 'file') {
             this.files.delete(node.uri.path);
+            this.invalidateGroups(node.uri.path);
             this.refreshAll();
         } else if (node.kind === 'variant') {
             let cachedFile = this.files.get(node.uri.path);
@@ -1066,6 +1394,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 let index = cachedFile.variants.indexOf(node);
                 if (index > -1) {
                     cachedFile.variants.splice(index, 1);
+                    this.invalidateGroups(cachedFile.uri.path);
                     this.refresh(cachedFile, cachedFile);
                 }
             }
@@ -1078,6 +1407,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     if (index > -1) {
                         variant.defines.defines.splice(index, 1);
                         // Refresh variant for description
+                        this.invalidateGroups(file.uri.path);
                         this.refresh(variant, file);
                         found = true;
                         break;
@@ -1095,6 +1425,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     let index = variant.includes.includes.indexOf(node);
                     if (index > -1) {
                         variant.includes.includes.splice(index, 1);
+                        this.invalidateGroups(file.uri.path);
                         this.refresh(variant.includes, file);
                         found = true;
                         break;

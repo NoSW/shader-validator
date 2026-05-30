@@ -4,6 +4,8 @@ import * as vscode from 'vscode';
 import {
 	parseShaderVariantConfig,
 	configToVariants,
+	mergeVariantConfigs,
+	groupVariantsByEntryPoint,
 	variantSignature,
 	ShaderStage,
 } from '../../view/shaderVariantTreeView';
@@ -116,5 +118,100 @@ suite('Variant Import Test Suite', () => {
 		assert.notStrictEqual(variantSignature(variants[0]), variantSignature(variants[1]));
 		// Identical content => identical signatures.
 		assert.strictEqual(variantSignature(variants[0]), variantSignature(variants[2]));
+	});
+
+	test('File-level common defines merge into every variant; variant overrides on conflict', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			file: "FXAAShader.usf",
+			language: "hlsl",
+			defines: { COMMON_A: "1", FXAA_PRESET: "0" },
+			includes: ["/common/inc"],
+			variants: [
+				{ entryPoint: "FxaaPS", stage: "fragment", defines: { FXAA_PRESET: "2", DIM: "1" }, includes: ["/variant/inc"] },
+				{ entryPoint: "FxaaPS2", stage: "fragment" }
+			]
+		}));
+		let variants = configToVariants(uri, config, "FXAAShader.usf");
+		assert.strictEqual(variants.length, 2);
+
+		// Variant 0: common + own, with the variant's FXAA_PRESET overriding the common value.
+		let d0 = new Map(variants[0].defines.defines.map(d => [d.label, d.value]));
+		assert.strictEqual(d0.get("COMMON_A"), "1");
+		assert.strictEqual(d0.get("FXAA_PRESET"), "2");
+		assert.strictEqual(d0.get("DIM"), "1");
+		assert.deepStrictEqual(variants[0].includes.includes.map(i => i.include), ["/common/inc", "/variant/inc"]);
+
+		// Variant 1 (no own defines/includes): just the common ones.
+		let d1 = new Map(variants[1].defines.defines.map(d => [d.label, d.value]));
+		assert.strictEqual(d1.get("COMMON_A"), "1");
+		assert.strictEqual(d1.get("FXAA_PRESET"), "0");
+		assert.deepStrictEqual(variants[1].includes.includes.map(i => i.include), ["/common/inc"]);
+	});
+
+	test('Common includes are de-duplicated against variant includes (order preserved)', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			includes: ["/inc/a", "/inc/b"],
+			variants: [{ entryPoint: "M", includes: ["/inc/b", "/inc/c"] }]
+		}));
+		let variants = configToVariants(uri, config, "FXAAShader.usf");
+		assert.deepStrictEqual(variants[0].includes.includes.map(i => i.include), ["/inc/a", "/inc/b", "/inc/c"]);
+	});
+
+	test('mergeVariantConfigs folds per-permutation configs, de-dups, and filters by file', () => {
+		// Five single-variant configs as an engine would dump them (different dump dirs).
+		const mk = (file: string, entryPoint: string, stage: string, defines: object) =>
+			parseShaderVariantConfig(JSON.stringify({ file, language: "hlsl", variants: [{ entryPoint, stage, defines }] }));
+		const configs = [
+			mk("D:/a/FXAAShader.usf", "FxaaPS", "fragment", { P: "0" }),
+			mk("Z:/b/FXAAShader.usf", "FxaaPS", "fragment", { P: "1" }),
+			mk("Q:/c/FXAAShader.usf", "FxaaPS", "fragment", { P: "0" }), // duplicate of #0 -> collapsed
+			mk("W:/d/FXAAShader.usf", "FxaaVS", "vertex", {}),
+			mk("D:/a/Other.usf", "MainCS", "compute", {}),             // different shader -> excluded
+		];
+		let merged = mergeVariantConfigs(uri, configs, "FXAAShader.usf");
+		assert.strictEqual(merged.length, 3);
+		let sig = (name: string, stage: ShaderStage, defs: string) =>
+			merged.some(v => v.name === name && v.stage.stage === stage && v.defines.defines.map(d => `${d.label}=${d.value}`).join(",") === defs);
+		assert.ok(sig("FxaaPS", ShaderStage.fragment, "P=0"));
+		assert.ok(sig("FxaaPS", ShaderStage.fragment, "P=1"));
+		assert.ok(sig("FxaaVS", ShaderStage.vertex, ""));
+		assert.ok(!merged.some(v => v.name === "MainCS"));
+	});
+
+	test('groupVariantsByEntryPoint groups by entry point, factors common defines, computes deltas', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			variants: [
+				{ entryPoint: "FxaaPS", stage: "fragment", defines: { COMMON: "1", SM6: "1", P: "0" } },
+				{ entryPoint: "FxaaPS", stage: "fragment", defines: { COMMON: "1", SM6: "1", P: "1" } },
+				{ entryPoint: "FxaaVS", stage: "vertex", defines: { COMMON: "1", SM6: "1" } }
+			]
+		}));
+		let groups = groupVariantsByEntryPoint(configToVariants(uri, config, "FXAAShader.usf"));
+		assert.strictEqual(groups.length, 2);
+
+		let ps = groups.find(g => g.name === "FxaaPS")!;
+		assert.strictEqual(ps.stage, ShaderStage.fragment);
+		assert.deepStrictEqual(ps.commonDefines.map(d => `${d.label}=${d.value}`).sort(), ["COMMON=1", "SM6=1"]);
+		assert.strictEqual(ps.permutations.length, 2);
+		assert.deepStrictEqual(
+			ps.permutations.map(p => p.deltaDefines.map(d => `${d.label}=${d.value}`).join(",")).sort(),
+			["P=0", "P=1"]
+		);
+
+		let vs = groups.find(g => g.name === "FxaaVS")!;
+		assert.strictEqual(vs.stage, ShaderStage.vertex);
+		assert.strictEqual(vs.permutations.length, 1);
+		assert.strictEqual(vs.permutations[0].deltaDefines.length, 0); // single permutation -> all common
+	});
+
+	test('groupVariantsByEntryPoint separates same entry point with different stages', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			variants: [
+				{ entryPoint: "Main", stage: "vertex" },
+				{ entryPoint: "Main", stage: "fragment" }
+			]
+		}));
+		let groups = groupVariantsByEntryPoint(configToVariants(uri, config, "FXAAShader.usf"));
+		assert.strictEqual(groups.length, 2);
 	});
 });

@@ -103,9 +103,9 @@ You can add one with the dedicated window or using the command `shader-validator
 
 ### Importing variants
 
-Defining variants by hand is tedious when a shader has many permutations. Instead, you can let the extension import them from a JSON config file. Set `shader-validator.variantFolder` to a folder, and when you open a shader the extension looks for `<name>.variants.json` then `<name>.json` in that folder (e.g. opening `FXAAShader.usf` loads `FXAAShader.json`). The config file is the source of truth: its variants **replace** the ones currently set for that shader, so re-opening the shader keeps the view in sync with the file. The config is also re-read when you switch the active variant, so toggling a variant always uses the latest data on disk.
+Defining variants by hand is tedious when a shader has many permutations. Instead, set `shader-validator.variantFolder` to a folder of JSON configs. When you open a shader, the extension **recursively scans** that folder for every JSON whose `file` matches the opened shader and **merges** them — all entry points and permutations, de-duplicated — into that shader's variants. It works both for a single hand-written `<name>.json` and for a deep tree of one-permutation-per-file dumps such as Unreal Engine's `Saved/ShaderDebugInfo` (point the setting at the dump root). The configs are the source of truth: re-opening the shader re-syncs the view, and switching the active variant re-reads the matching files.
 
-This is handy for engines such as Unreal that can dump every compiled permutation of a shader (entry point, stage and defines) to disk.
+This is handy for engines such as Unreal that can dump every compiled permutation of a shader (entry point, stage and defines) to disk. Each dumped file is one permutation; the extension folds them together on open.
 
 ```json
 {
@@ -139,6 +139,20 @@ This is handy for engines such as Unreal that can dump every compiled permutatio
 }
 ```
 
+File-level `defines` and `includes` are also supported: anything set at the file level is applied to **every** variant of that file, with a variant's own `defines`/`includes` taking precedence on conflict. This lets you factor out the macros shared by all variants instead of repeating them in each one:
+
+```json
+{
+    "file": "D:/UnrealEngine/Engine/Shaders/Private/FXAAShader.usf",
+    "language": "hlsl",
+    "defines": { "COMPILER_DXC": "1", "SM6_PROFILE": "1" },
+    "variants": [
+        { "entryPoint": "FxaaPS", "stage": "fragment", "defines": { "FXAA_PRESET": "0" } },
+        { "entryPoint": "FxaaPS", "stage": "fragment", "defines": { "FXAA_PRESET": "1" } }
+    ]
+}
+```
+
 ### Regions
 
 Grey out inactive regions depending on currently declared preprocessor & filter symbols.
@@ -163,7 +177,7 @@ This extension contributes the following settings:
 *   `shader-validator.stageDefine.[vertex|fragment|compute...]`: All custom macros and their values for custom shader stages.
 *   `shader-validator.serverPath`: Use a custom server instead of the bundled one.
 *   `shader-validator.updateSymbolsOnVariantUpdate`: Update symbol outline when changing variant. Will trigger a save event.
-*   `shader-validator.variantFolder`: Folder to look up shader variant config files (JSON) and auto-import them when opening a shader. See [Importing variants](#importing-variants).
+*   `shader-validator.variantFolder`: Folder scanned recursively for JSON variant configs, merged per shader on open. See [Importing variants](#importing-variants).
 *   `shader-validator.trace.server`: Show debug logs into an output channel. Can be accessed via shader-validator status bar.
 
 ### HLSL specific settings: 

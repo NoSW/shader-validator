@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- New setting `shader-validator.variantFolder` to auto-import shader variants from a JSON config file (`<shader>.variants.json` or `<shader>.json`) when opening a shader. The config is re-read when switching the active variant so it always reflects the latest data on disk. Resolves [#46](https://github.com/antaalt/shader-validator/issues/46).
+- New setting `shader-validator.variantFolder`: on opening a shader, the extension recursively scans this folder and merges every JSON config matching the shader — all entry points and permutations, de-duplicated — into its variants (handy for engine dumps such as Unreal's ShaderDebugInfo, where each file is one permutation). File-level `defines`/`includes` can be declared once and are merged into every variant (the variant's own values win on conflict). Resolves [#46](https://github.com/antaalt/shader-validator/issues/46).
+- The Shader variants panel now groups a file's permutations by entry point, showing the shared stage, the defines common to all permutations, the shared includes, and a `defines` list with one node per permutation (each showing only its differing defines). The active-variant checkbox lives on the permutation node.
+- The Shader variants panel auto-reveals the node of the shader file in the active editor (without stealing focus) when switching or opening editors.
 
 ## [1.3.3] - 2026-05-24
 
