@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { CancellationToken, DocumentSymbol, DocumentSymbolRequest, DocumentUri, LanguageClient, ProtocolNotificationType, ProtocolRequestType, Range, SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentRegistrationOptions } from 'vscode-languageclient/node';
 // LSP protocol types for sending a synthetic didChange (forces server re-parse without dirtying the editor).
-import { DidChangeTextDocumentNotification } from 'vscode-languageserver-protocol';
+import { DidChangeTextDocumentNotification, DidChangeConfigurationNotification } from 'vscode-languageserver-protocol';
 import { resolveVSCodeVariables, ShaderLanguageClient } from '../client';
 
 interface ShaderVariantSerialized {
@@ -971,6 +971,13 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 await this.server.sendNotification(didChangeShaderVariantNotification, {
                     shaderVariant,
                 });
+                // The server merges the global `shader-validator.defines` setting ON TOP of the
+                // variant's own defines (config wins, see ServerConfig::into_shader_params), which
+                // would clobber any per-variant common/varying define that shares a key with a
+                // global define.  Nudge the server to re-pull its configuration so the client's
+                // configuration middleware can re-inject the active variant's define values for the
+                // conflicting keys (see getActiveVariantDefineOverrides).
+                await this.server.sendNotification(DidChangeConfigurationNotification.type, { settings: null });
                 if (symbolUri) {
                     // Send a synthetic textDocument/didChange with the full file content to force
                     // the server to re-parse.  didChangeShaderVariant alone updates the defines on
@@ -1021,6 +1028,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             if (d.value !== '_') { fullDefines[d.label] = d.value; }
         }
         return fullDefines;
+    }
+    // Effective defines of the variant currently sent to the server (real permutation OR a synthetic
+    // varying selection), or null when no variant is active.  Used by the client's configuration
+    // middleware to make per-variant defines win over the global `shader-validator.defines` setting
+    // (the server otherwise lets the global config override them — see Bug1).
+    public getActiveVariantDefineOverrides(): { [key: string]: string } | null {
+        const sent = this.lastSentShaderVariant;
+        if (!sent || !sent.defines) { return null; }
+        return sent.defines as { [key: string]: string };
     }
     private notifyVariantChanged() {
         function capitalizeFirstLetter(str: string): string {
@@ -2194,6 +2210,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
             this.invalidateGroups(resolved.group.uri.path);
             this.refresh(resolved.file, resolved.file);
+            // Force the server to re-parse with the edited common/varying define.
+            this.notifyVariantChanged();
         }
     }
     public delete(node: ShaderVariantNode) {
@@ -2264,6 +2282,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
             this.invalidateGroups(resolved.group.uri.path);
             this.refresh(resolved.file, resolved.file);
+            // Force the server to re-parse with the common/varying define removed.
+            this.notifyVariantChanged();
         } else if (node.kind === 'varyingDefineValue') {
             // Remove all permutations that have this key=value.
             const owner = this.lookupEntryGroup(node.selectionKey);

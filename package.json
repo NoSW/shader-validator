@@ -532,12 +532,6 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "shader-validator.reparseCurrentVariant",
-        "title": "Reparse current shader variant",
-        "category": "Shader validator",
-        "icon": "$(sync)"
-      },
-      {
         "command": "shader-validator.copyDefineName",
         "title": "Copy define name",
         "category": "Shader validator",
@@ -548,6 +542,12 @@
         "title": "Search define name",
         "category": "Shader validator",
         "icon": "$(search)"
+      },
+      {
+        "command": "shader-validator.toggleTreeView",
+        "title": "Toggle tree / flat view",
+        "category": "Shader validator",
+        "icon": "$(list-tree)"
       }
     ],
     "menus": {
@@ -569,7 +569,7 @@
           "group": "navigation"
         },
         {
-          "command": "shader-validator.reparseCurrentVariant",
+          "command": "shader-validator.toggleTreeView",
           "when": "view == shader-validator-variants",
           "group": "navigation"
         }
@@ -578,7 +578,7 @@
         {
           "command": "shader-validator.addMenu",
           "group": "inline@1",
-          "when": "view == shader-validator-variants && (viewItem == file || viewItem == includeList || viewItem == defineList)"
+          "when": "view == shader-validator-variants && (viewItem == file || viewItem == includeList || viewItem == defineList || viewItem == commonDefineList || viewItem == varyingDefineList || viewItem == varyingDefine)"
         },
         {
           "command": "shader-validator.refreshVariants",
@@ -588,7 +588,7 @@
         {
           "command": "shader-validator.editMenu",
           "group": "inline@3",
-          "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == stage)"
+          "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == stage || viewItem == readonlyDefine)"
         },
         {
           "command": "shader-validator.copyDefineName",
@@ -603,7 +603,7 @@
         {
           "command": "shader-validator.deleteMenu",
           "group": "inline@5",
-          "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == file)"
+          "when": "view == shader-validator-variants && (viewItem == variant || viewItem == include || viewItem == define || viewItem == file || viewItem == readonlyDefine || viewItem == varyingDefineValue || viewItem == entryGroup || viewItem == varyingDefine)"
         }
       ]
     },

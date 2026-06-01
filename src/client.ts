@@ -255,6 +255,22 @@ function getMiddleware() : Middleware {
                 console.debug("initial configuration", result);
                 let resultArray = result as any[];
                 let config = resolveConfigurationPathVariables(resultArray[0]);
+                // Bug1: the server merges the global `shader-validator.defines` setting on top of the
+                // active variant's defines (config wins), which clobbers per-variant common/varying
+                // defines that share a key with a global define.  Override the value of any such
+                // conflicting global key with the active variant's value so the variant wins.  We only
+                // touch keys already present in the global config (no new keys) to avoid leaking
+                // variant-specific defines onto files that have no active variant.
+                const activeOverrides = sidebar?.getActiveVariantDefineOverrides?.();
+                if (activeOverrides && config["defines"] && typeof config["defines"] === "object") {
+                    const defines = { ...config["defines"] };
+                    for (const key of Object.keys(defines)) {
+                        if (Object.prototype.hasOwnProperty.call(activeOverrides, key)) {
+                            defines[key] = activeOverrides[key];
+                        }
+                    }
+                    config["defines"] = defines;
+                }
                 console.debug("resolved configuration", config);
                 return [config];
             }
