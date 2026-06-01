@@ -398,7 +398,9 @@ export function groupVariantsByEntryPoint(variants: ShaderVariant[]): EntryGroup
         return {
             name: permutations[0].name,
             stage: permutations[0].stage.stage,
-            commonDefines: [...common].map(([label, value]) => ({ label, value })),
+            // Common defines are shown sorted alphabetically (rebuilt on every add/delete). Varying
+            // define keys are sorted separately in buildVaryingDefines.
+            commonDefines: [...common].map(([label, value]) => ({ label, value })).sort((a, b) => a.label.localeCompare(b.label)),
             includes: commonIncludes ? [...commonIncludes] : [],
             permutations: permutations.map(variant => {
                 const variantKeys = new Set(variant.defines.defines.map(d => d.label));
@@ -976,8 +978,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 // would clobber any per-variant common/varying define that shares a key with a
                 // global define.  Nudge the server to re-pull its configuration so the client's
                 // configuration middleware can re-inject the active variant's define values for the
-                // conflicting keys (see getActiveVariantDefineOverrides).
-                await this.server.sendNotification(DidChangeConfigurationNotification.type, { settings: null });
+                // conflicting keys (see getActiveVariantDefineOverrides).  Only do this when global
+                // defines actually exist — otherwise there is nothing to override and the config
+                // round-trip (and possible full-workspace revalidation) would be pure overhead.
+                if (this.hasGlobalDefines()) {
+                    await this.server.sendNotification(DidChangeConfigurationNotification.type, { settings: null });
+                }
                 if (symbolUri) {
                     // Send a synthetic textDocument/didChange with the full file content to force
                     // the server to re-parse.  didChangeShaderVariant alone updates the defines on
@@ -1037,6 +1043,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         const sent = this.lastSentShaderVariant;
         if (!sent || !sent.defines) { return null; }
         return sent.defines as { [key: string]: string };
+    }
+    // Whether the user has any global `shader-validator.defines` configured. Used to skip the
+    // configuration re-pull nudge (Bug1) when there is nothing a variant could override.
+    private hasGlobalDefines(): boolean {
+        const globalDefines = vscode.workspace.getConfiguration("shader-validator").get<{ [key: string]: string }>("defines");
+        return globalDefines !== undefined && globalDefines !== null && Object.keys(globalDefines).length > 0;
     }
     private notifyVariantChanged() {
         function capitalizeFirstLetter(str: string): string {
@@ -1458,8 +1470,47 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     }
     private invalidateGroups(filePath: string) {
         this.groupCache.delete(filePath);
-        this.varyingSelection.clear();
         this.dirTreeRoots = null;
+        // Preserve the user's varying-define check state across structural changes: varyingSelection
+        // is keyed by `${filePath}::${groupName}` and intentionally survives groupCache invalidation.
+        // Only drop entries that no longer map to a real varying key/value (e.g. after deleting a
+        // varying value/key or an entry group) so add/delete of common/varying defines keeps the
+        // previously-checked values checked instead of unchecking everything.
+        this.pruneVaryingSelection(filePath);
+    }
+    // Drop varying-define selections for a file that no longer correspond to a real varying
+    // key/value. Valid selections are kept (preserving the user's check state); an emptied group
+    // selection is removed so the next group build can re-seed it from the active permutation.
+    private pruneVaryingSelection(filePath: string): void {
+        const file = this.files.get(filePath);
+        const validGroupKeys = new Set<string>();
+        if (file) {
+            for (const group of groupVariantsByEntryPoint(file.variants)) {
+                const selectionKey = `${filePath}::${group.name}`;
+                validGroupKeys.add(selectionKey);
+                const sel = this.varyingSelection.get(selectionKey);
+                if (!sel) { continue; }
+                const varying = buildVaryingDefines(group, selectionKey);
+                const validValues = new Map<string, Set<string>>();
+                if (varying) {
+                    for (const vd of varying.defines) {
+                        validValues.set(vd.label, new Set(vd.values.map(v => v.label)));
+                    }
+                }
+                for (const [key, value] of [...sel]) {
+                    const allowed = validValues.get(key);
+                    if (!allowed || !allowed.has(value)) { sel.delete(key); }
+                }
+                if (sel.size === 0) { this.varyingSelection.delete(selectionKey); }
+            }
+        }
+        // Remove selections for groups of this file that no longer exist.
+        const prefix = `${filePath}::`;
+        for (const key of [...this.varyingSelection.keys()]) {
+            if (key.startsWith(prefix) && !validGroupKeys.has(key)) {
+                this.varyingSelection.delete(key);
+            }
+        }
     }
     // Seed varyingSelection from the active permutation in a group (used on first group build).
     private initVaryingSelectionFromGroup(group: EntryGroupData, selectionKey: string): void {
@@ -1634,6 +1685,35 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     includes,
                 }, ownerGroup.uri);
         });
+    }
+    // Re-parse a group after a structural mutation (add/delete of a common/varying define).
+    // Crucially, this re-sends whatever the user currently has selected so the shader is actually
+    // re-parsed with the updated defines:
+    //   - if a real permutation of this group is active -> send it (notifyVariantChanged),
+    //   - else if the group has a varying-define selection (preserved check state) -> re-send it
+    //     via notifyVaryingSelection (this is the case notifyVariantChanged alone would miss, since
+    //     it would send `null` and drop the selection),
+    //   - else fall back to the global active variant / clear.
+    private reparseAfterGroupMutation(selectionKey: string): void {
+        const idx = selectionKey.lastIndexOf('::');
+        const filePath = idx >= 0 ? selectionKey.substring(0, idx) : selectionKey;
+        // The mutation invalidated the group cache; rebuild it now so lookupEntryGroup /
+        // notifyVaryingSelection have the (updated) group available synchronously.
+        const file = this.files.get(filePath);
+        if (file) { this.getEntryGroups(file); }
+        const group = this.lookupEntryGroup(selectionKey);
+        const groupHasActivePermutation = group?.permutationList.permutations.some(p => p.variant.isActive) ?? false;
+        if (groupHasActivePermutation) {
+            this.notifyVariantChanged();
+            return;
+        }
+        const sel = this.varyingSelection.get(selectionKey);
+        if (sel && sel.size > 0) {
+            this.notifyVaryingSelection(selectionKey, sel);
+            return;
+        }
+        // Nothing selected in this group: re-send the globally-active variant, or clear.
+        this.notifyVariantChanged();
     }
     // Clear the varying selection for this entry group and tell the server there is no active variant.
     private notifyVaryingClear(selectionKey: string): void {
@@ -2060,8 +2140,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 else { perm.variant.defines.defines.push({ kind: 'define', label, value }); }
             }
             this.invalidateGroups(owner.group.uri.path);
-            this.refresh(owner.file, owner.file);
-            this.notifyVariantChanged();
+            this.refreshTreeOnly();
+            this.reparseAfterGroupMutation(`${owner.group.uri.path}::${owner.group.name}`);
         } else if (node.kind === 'varyingDefineList') {
             // Add a define to the active permutation only.
             const owner = this.findEntryGroupByNode(node);
@@ -2083,8 +2163,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             if (existing) { existing.value = value; }
             else { target.variant.defines.defines.push({ kind: 'define', label, value }); }
             this.invalidateGroups(owner.group.uri.path);
-            this.refresh(owner.file, owner.file);
-            this.notifyVariantChanged();
+            this.refreshTreeOnly();
+            this.reparseAfterGroupMutation(`${owner.group.uri.path}::${owner.group.name}`);
         } else if (node.kind === 'varyingDefine') {
             // Add a new value for this varying key by cloning EVERY existing permutation in the
             // entry group and setting the key to the new value in each clone — this properly
@@ -2127,8 +2207,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             if (file) {
                 file.variants.push(...clones);
                 this.invalidateGroups(owner.uri.path);
-                this.refresh(file, file);
-                this.notifyVariantChanged();
+                this.refreshTreeOnly();
+                this.reparseAfterGroupMutation(node.selectionKey);
             }
         }
     }
@@ -2209,9 +2289,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 if (label && label !== node.label && def) { def.label = label; }
             }
             this.invalidateGroups(resolved.group.uri.path);
-            this.refresh(resolved.file, resolved.file);
-            // Force the server to re-parse with the edited common/varying define.
-            this.notifyVariantChanged();
+            this.refreshTreeOnly();
+            // Re-parse with the edited common/varying define, preserving the current selection.
+            this.reparseAfterGroupMutation(`${resolved.group.uri.path}::${resolved.group.name}`);
         }
     }
     public delete(node: ShaderVariantNode) {
@@ -2281,9 +2361,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 if (idx > -1) { resolved.variant!.defines.defines.splice(idx, 1); }
             }
             this.invalidateGroups(resolved.group.uri.path);
-            this.refresh(resolved.file, resolved.file);
-            // Force the server to re-parse with the common/varying define removed.
-            this.notifyVariantChanged();
+            this.refreshTreeOnly();
+            // Re-parse with the define removed, preserving the current selection.
+            this.reparseAfterGroupMutation(`${resolved.group.uri.path}::${resolved.group.name}`);
         } else if (node.kind === 'varyingDefineValue') {
             // Remove all permutations that have this key=value.
             const owner = this.lookupEntryGroup(node.selectionKey);
@@ -2295,8 +2375,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     return !def || def.value !== node.label;
                 });
                 this.invalidateGroups(owner.uri.path);
-                this.refresh(file, file);
-                this.notifyVariantChanged();
+                this.refreshTreeOnly();
+                this.reparseAfterGroupMutation(node.selectionKey);
             }
         } else if (node.kind === 'varyingDefine') {
             // Delete this single varying key — remove it from all permutations' defines.
@@ -2308,30 +2388,38 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     perm.variant.defines.defines = perm.variant.defines.defines.filter(d => d.label !== node.label);
                 }
                 this.invalidateGroups(owner.uri.path);
-                this.refresh(file, file);
-                this.notifyVariantChanged();
+                this.refreshTreeOnly();
+                this.reparseAfterGroupMutation(node.selectionKey);
             }
         } else if (node.kind === 'entryGroup') {
             let file = this.files.get(node.uri.path);
             if (file) {
                 file.variants = file.variants.filter(v => !(v.name === node.name && v.stage.stage === node.stageNode.stage));
                 this.invalidateGroups(node.uri.path);
-                this.refresh(file, file);
+                this.refreshTreeOnly();
                 this.notifyVariantChanged();
             }
         }
     }
     private getDecorator(langId: string) : vscode.TextEditorDecorationType {
-        // Use decorator or a default one.
-        return this.decorator.get(langId) || vscode.window.createTextEditorDecorationType({
-            // Minimap
-            overviewRulerColor: "rgb(0, 174, 255)",
-            overviewRulerLane: vscode.OverviewRulerLane.Full,
-            rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen,
-            // Border
-            borderWidth: '1px',
-            borderStyle: 'solid',
-        });
+        // Use the decorator for this language, or lazily create & cache a default one.  Caching is
+        // essential: getDecorator runs on every decoration update for *every* visible editor
+        // (including non-shader files, to clear them), so creating a fresh decoration type each time
+        // would leak vscode.TextEditorDecorationType objects continuously.
+        let decorator = this.decorator.get(langId);
+        if (!decorator) {
+            decorator = vscode.window.createTextEditorDecorationType({
+                // Minimap
+                overviewRulerColor: "rgb(0, 174, 255)",
+                overviewRulerLane: vscode.OverviewRulerLane.Full,
+                rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen,
+                // Border
+                borderWidth: '1px',
+                borderStyle: 'solid',
+            });
+            this.decorator.set(langId, decorator);
+        }
+        return decorator;
     }
     private updateDecoration(editor: vscode.TextEditor) {
         let file = this.files.get(editor.document.uri.path);

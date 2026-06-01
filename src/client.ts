@@ -243,7 +243,9 @@ function getMiddleware() : Middleware {
             if (result) {
                 // /!\ Type casting need to match server data sent. /!\ 
                 let resultArray = result as vscode.DocumentSymbol[];
-                sidebar.onDocumentSymbols(document.uri, resultArray);
+                // sidebar may be undefined if a symbol request resolves during server startup
+                // (the server is started before the sidebar is constructed in extension.ts).
+                sidebar?.onDocumentSymbols(document.uri, resultArray);
             }
             return result;
         },
