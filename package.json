@@ -532,6 +532,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "shader-validator.recollectPermutationFromJson",
+        "title": "Shader validator: Re-collect permutation from JSON",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "shader-validator.copyDefineName",
         "title": "Copy define name",
         "category": "Shader validator",
@@ -555,6 +560,13 @@
         {
           "command": "shader-validator.gotoShaderEntryPoint",
           "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "shader-validator.recollectPermutationFromJson",
+          "when": "editorLangId == hlsl || editorLangId == glsl || editorLangId == wgsl",
+          "group": "shader-validator@1"
         }
       ],
       "view/title": [

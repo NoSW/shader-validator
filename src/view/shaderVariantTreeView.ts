@@ -723,6 +723,19 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 }
             }
         ));
+        // Editor right-click entry — re-collects permutations from the variant JSON folder for the
+        // shader file in the active editor (same as the panel's Refresh, but invoked from the editor).
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.recollectPermutationFromJson",
+            async () => {
+                const document = vscode.window.activeTextEditor?.document;
+                if (!this.canManageShaderDocument(document)) {
+                    vscode.window.showWarningMessage("Re-collect permutation from JSON requires an open local shader file (.usf/.ush/.hlsl/.glsl/.wgsl).");
+                    return;
+                }
+                await this.importVariantsFromConfig(document.uri, true);
+            }
+        ));
         context.subscriptions.push(vscode.commands.registerCommand(
             "shader-validator.toggleTreeView",
             () => {
@@ -1088,7 +1101,14 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         // See https://github.com/microsoft/vscode/issues/108722
 
         let updateSymbolsOnVariantUpdate = vscode.workspace.getConfiguration("shader-validator").get<boolean>("updateSymbolsOnVariantUpdate");
-        if (updateSymbolsOnVariantUpdate) {
+        // Only analyze files that are actually open in an editor.  The document symbols are consumed
+        // solely to update the entry-point cache used for decorations & goto, which only apply to
+        // open editors.  Proactively analyzing a closed file (e.g. the active-variant file restored
+        // from a previous session, or every tracked file scanned on server start by
+        // updateDependencies) forces the server to parse large shader include trees and shows a
+        // spurious "Analyzing shader files" progress for a file the user never opened.
+        const isOpen = vscode.workspace.textDocuments.some(d => d.uri.path === uri.path);
+        if (updateSymbolsOnVariantUpdate && isOpen) {
             return this.withShaderAnalysisProgress(uri, async () => {
                 const result = await this.server.sendRequest(DocumentSymbolRequest.type, {
                     textDocument: {
@@ -1955,8 +1975,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
     }
     // Replace the variants of a file with imported ones, only if they actually differ (avoids
-    // churn & dirty edits when re-opening). Preserves the active selection when a matching
-    // variant still exists.
+    // churn & dirty edits when re-opening). After import/refresh a default variant is auto-selected:
+    // the default permutation (custom === "0") for `.usf` shaders, or the first (#0) variant for any
+    // other file.
     private applyImportedVariants(uri: vscode.Uri, variants: ShaderVariant[]): void {
         let file = this.files.get(uri.path);
         // Change detection by full signature, ignoring active state & order-independent of it.
@@ -1964,14 +1985,19 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (file && project(file.variants) === project(variants)) {
             return; // Nothing changed.
         }
-        // Preserve active selection if a matching variant still exists in the new set.
-        let previousActive = file ? file.variants.find(v => v.isActive) : undefined;
-        if (previousActive) {
-            let previousSignature = variantSignature(previousActive);
-            let match = variants.find(v => variantSignature(v) === previousSignature);
-            if (match) {
-                match.isActive = true;
+        // Auto-activate a default variant after import/refresh so it immediately validates:
+        //  - `.usf` shaders use the default permutation (custom === "0", i.e. PermutationId 0),
+        //  - any other file uses the first (#0) variant, regardless of its custom value.
+        // In both cases fall back to the first variant when no better match exists.
+        const isUsf = uri.path.toLowerCase().endsWith('.usf');
+        const defaultVariant = (isUsf ? variants.find(v => v.custom === '0') : undefined) ?? variants[0];
+        if (defaultVariant) {
+            // Enforce the single-active-variant model: clear any active variant in other files.
+            for (const [otherPath, otherFile] of this.files) {
+                if (otherPath === uri.path) { continue; }
+                for (const v of otherFile.variants) { v.isActive = false; }
             }
+            defaultVariant.isActive = true;
         }
         if (file) {
             file.variants = variants;
