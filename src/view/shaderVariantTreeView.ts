@@ -1642,7 +1642,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // Load the config(s) for a shader and replace its variants in the tree. Returns the imported
     // configs were found and applied. Used only by explicit user actions (Refresh / Add File).
     private async importVariantsFromConfig(uri: vscode.Uri, forceRescan: boolean = true): Promise<number> {
-        const statusMessage = vscode.window.setStatusBarMessage("collect variant json...");
+        const statusMessage = vscode.window.setStatusBarMessage("Collecting variant json...");
         try {
             let variants = await this.loadVariantsFromConfig(uri, forceRescan);
             if (variants) {
