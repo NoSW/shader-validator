@@ -120,7 +120,7 @@ export type ShaderEntryPoint = {
 // node per permutation. The active checkbox lives on the permutation node, which shows only the
 // defines that differ from the group's common defines. These nodes use contextValues that do not
 // match any package.json menu 'when' clause, so they carry no manual add/edit/delete inline icons.
-export type ShaderReadonlyDefine = { kind: 'readonlyDefine', label: string, value: string };
+export type ShaderReadonlyDefine = { kind: 'readonlyDefine', label: string, value: string, groupName?: string };
 export type ShaderReadonlyInclude = { kind: 'readonlyInclude', include: string };
 export type ShaderGroupStage = { kind: 'groupStage', stage: ShaderStage };
 export type ShaderCommonDefineList = { kind: 'commonDefineList', defines: ShaderReadonlyDefine[] };
@@ -156,6 +156,15 @@ export type ShaderVaryingDefineList = {
     defines: ShaderVaryingDefine[],
 };
 
+// Directory node for the tree-view mode (flat vs hierarchical file list).
+export type ShaderDirectoryNode = {
+    kind: 'directory',
+    name: string,          // display name (single path segment)
+    relPath: string,       // relative path from workspace root (key)
+    children: ShaderVariantNode[],
+    fileCount: number,     // total files recursively under this directory
+};
+
 export type ShaderEntryGroup = {
     kind: 'entryGroup',
     uri: vscode.Uri,
@@ -170,7 +179,7 @@ export type ShaderEntryGroup = {
 
 export type ShaderVariantNode = ShaderVariant | ShaderVariantFile | ShaderVariantDefineList | ShaderVariantIncludeList | ShaderVariantDefine | ShaderVariantInclude | ShaderVariantStage
     | ShaderEntryGroup | ShaderGroupStage | ShaderCommonDefineList | ShaderGroupIncludeList | ShaderPermutationList | ShaderPermutation | ShaderReadonlyDefine | ShaderReadonlyInclude
-    | ShaderVaryingDefineList | ShaderVaryingDefine | ShaderVaryingDefineValue;
+    | ShaderVaryingDefineList | ShaderVaryingDefine | ShaderVaryingDefineValue | ShaderDirectoryNode;
 
 // Configuration file schema used by the shader-validator.variantFolder import feature.
 // A config describes the variants of one shader (single-file form) or several (multi-file form).
@@ -379,17 +388,31 @@ export function groupVariantsByEntryPoint(variants: ShaderVariant[]): EntryGroup
             if (commonIncludes === null) { commonIncludes = set; }
             else { for (let include of [...commonIncludes]) { if (!set.has(include)) { commonIncludes.delete(include); } } }
         }
+        // Union of all define keys across all permutations — needed for the `_` (undefined) value.
+        const allKeys = new Set<string>();
+        for (const variant of permutations) {
+            for (const d of variant.defines.defines) {
+                if (!common.has(d.label)) { allKeys.add(d.label); }
+            }
+        }
         return {
             name: permutations[0].name,
             stage: permutations[0].stage.stage,
             commonDefines: [...common].map(([label, value]) => ({ label, value })),
             includes: commonIncludes ? [...commonIncludes] : [],
-            permutations: permutations.map(variant => ({
-                variant: variant,
-                deltaDefines: variant.defines.defines
+            permutations: permutations.map(variant => {
+                const variantKeys = new Set(variant.defines.defines.map(d => d.label));
+                const delta: { label: string, value: string }[] = variant.defines.defines
                     .filter(d => common.get(d.label) !== d.value)
-                    .map(d => ({ label: d.label, value: d.value })),
-            })),
+                    .map(d => ({ label: d.label, value: d.value }));
+                // For every varying key absent from this variant, add `key=_` (undefined).
+                for (const key of allKeys) {
+                    if (!variantKeys.has(key)) {
+                        delta.push({ label: key, value: '_' });
+                    }
+                }
+                return { variant, deltaDefines: delta };
+            }),
         };
     });
 }
@@ -458,6 +481,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // Updated on permutation checkbox / varyingDefineValue checkbox changes, or initialized from the
     // active permutation when groups are built.  Keyed by string so it survives groupCache invalidation.
     private varyingSelection: Map<string, Map<string, string>> = new Map();
+    // Toggle between flat file list and directory-tree view.
+    private treeMode: boolean = false;
+    // Cached directory tree (rebuilt when files change or treeMode toggles).
+    private dirCache: Map<string, ShaderDirectoryNode> = new Map();
+    private dirTreeRoots: ShaderVariantNode[] | null = null;
 
     private inferShaderLanguageId(uri: vscode.Uri): string | null {
         const path = uri.path.toLowerCase();
@@ -694,13 +722,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
         ));
         context.subscriptions.push(vscode.commands.registerCommand(
-            "shader-validator.reparseCurrentVariant",
+            "shader-validator.toggleTreeView",
             () => {
-                if (this.lastSentShaderVariant !== null || this.lastSentShaderVariantUri !== null) {
-                    this.sendShaderVariantNotification(this.lastSentShaderVariant, this.lastSentShaderVariantUri ?? undefined, true);
-                } else {
-                    this.notifyVariantChanged();
-                }
+                this.treeMode = !this.treeMode;
+                this.dirTreeRoots = null;
+                this.onDidChangeTreeDataEmitter.fire();
             }
         ));
         context.subscriptions.push(vscode.commands.registerCommand(
@@ -969,24 +995,32 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             });
     }
     private getEffectiveDefinesForVariant(variant: ShaderVariant): { [key: string]: string } {
+        // Start with global shader-validator.defines as a base; the variant's own defines
+        // overlay on top and always win on conflict.
+        const globalDefines: { [key: string]: string } =
+            vscode.workspace.getConfiguration("shader-validator").get<{ [key: string]: string }>("defines") ?? {};
+        const fullDefines: { [key: string]: string } = { ...globalDefines };
         const groups = this.groupCache.get(variant.uri.path);
         if (groups) {
             for (const group of groups) {
                 for (const perm of group.permutationList.permutations) {
                     if (perm.variant === variant) {
-                        const fullDefines: { [key: string]: string } = {};
                         for (const d of group.commonDefineList.defines) {
-                            fullDefines[d.label] = d.value;
+                            if (d.value !== '_') { fullDefines[d.label] = d.value; }
                         }
                         for (const d of perm.deltaDefines) {
-                            fullDefines[d.label] = d.value;
+                            if (d.value !== '_') { fullDefines[d.label] = d.value; }
                         }
                         return fullDefines;
                     }
                 }
             }
         }
-        return Object.fromEntries(variant.defines.defines.map(d => [d.label, d.value]));
+        // Fallback: overlay the raw variant defines on top of global.
+        for (const d of variant.defines.defines) {
+            if (d.value !== '_') { fullDefines[d.label] = d.value; }
+        }
+        return fullDefines;
     }
     private notifyVariantChanged() {
         function capitalizeFirstLetter(str: string): string {
@@ -1001,7 +1035,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             vscode.workspace.openTextDocument(activeVariant.uri).then(doc => {
                 this.sendShaderVariantNotification(
                     shaderVariantToSerialized(
-                        this.server.uriAsString(activeVariant.uri), 
+                        this.server.uriAsString(activeVariant.uri),
                         capitalizeFirstLetter(doc.languageId), // Server expect it with capitalized first letter.
                         activeVariant,
                         this.getEffectiveDefinesForVariant(activeVariant)
@@ -1012,7 +1046,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         } else {
             this.sendShaderVariantNotification(null);
         }
-        
+
     }
     private requestDocumentSymbol(uri: vscode.Uri): Promise<void> {
         // TODO: should request inlay hint aswell.
@@ -1091,11 +1125,23 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             item.contextValue = element.kind;
             return item;
         } else if (element.kind === 'file') {
-            let item = new vscode.TreeItem(vscode.workspace.asRelativePath(element.uri), vscode.TreeItemCollapsibleState.Expanded);
-            item.description = `${element.variants.length}`;
+            const relPath = vscode.workspace.asRelativePath(element.uri);
+            const lastSlash = Math.max(relPath.lastIndexOf('/'), relPath.lastIndexOf('\\'));
+            const fileName = lastSlash >= 0 ? relPath.slice(lastSlash + 1) : relPath;
+            const dirPath = lastSlash >= 0 ? relPath.slice(0, lastSlash + 1) : '';
+            let item = new vscode.TreeItem(fileName, vscode.TreeItemCollapsibleState.Expanded);
+            item.description = dirPath ? `${dirPath}  ${element.variants.length}` : `${element.variants.length}`;
             item.resourceUri = element.uri;
             item.tooltip = `File ${element.uri.fsPath}`;
             item.iconPath = vscode.ThemeIcon.File;
+            item.contextValue = element.kind;
+            return item;
+        } else if (element.kind === 'directory') {
+            const dir = element as ShaderDirectoryNode;
+            const item = new vscode.TreeItem(dir.name, vscode.TreeItemCollapsibleState.Collapsed);
+            item.description = `${dir.fileCount}`;
+            item.tooltip = dir.relPath;
+            item.iconPath = vscode.ThemeIcon.Folder;
             item.contextValue = element.kind;
             return item;
         } else if (element.kind === 'defineList') {
@@ -1139,8 +1185,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 command: 'shader-validator.gotoShaderEntryPoint',
                 arguments: [element.uri, element.name]
             };
-            item.description = `${element.permutationCount}`;
-            item.tooltip = `Entry point ${element.name} (${element.permutationCount} permutation${element.permutationCount === 1 ? '' : 's'})`;
+            const stageName = ShaderStage[element.stageNode.stage];
+            item.description = `${stageName}  ${element.permutationCount}`;
+            item.tooltip = `Entry point ${element.name} — ${stageName} (${element.permutationCount} permutation${element.permutationCount === 1 ? '' : 's'})`;
             item.iconPath = new vscode.ThemeIcon('symbol-function');
             item.contextValue = element.kind;
             return item;
@@ -1256,20 +1303,23 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
 
     public getChildren(element?: ShaderVariantNode): ShaderVariantNode[] | Thenable<ShaderVariantNode[]> {
         if (!element) {
+            if (this.treeMode) {
+                return this.buildFileTree();
+            }
             return Array.from(this.files.values());
         }
         switch (element.kind) {
+            case 'directory': return (element as ShaderDirectoryNode).children;
             case 'file': return this.getEntryGroups(element);
             case 'entryGroup': {
                 const children: ShaderVariantNode[] = [
-                    element.stageNode,
                     element.commonDefineList,
                     element.includeList,
                     element.permutationList,
                 ];
                 // Insert varyingDefineList after commonDefineList when non-empty.
                 if (element.varyingDefineList.defines.length > 0) {
-                    children.splice(2, 0, element.varyingDefineList);
+                    children.splice(1, 0, element.varyingDefineList);
                 }
                 return children;
             }
@@ -1286,6 +1336,66 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             // Leaf & legacy kinds have no children in the grouped view.
             default: return [];
         }
+    }
+    // Build (or reuse) a hierarchical directory tree from the flat file map. Returns the root-level
+    // directory nodes; files are placed as leaf children under their respective directories.
+    private buildFileTree(): ShaderVariantNode[] {
+        if (this.dirTreeRoots) { return this.dirTreeRoots; }
+        this.dirCache.clear();
+        const roots: ShaderVariantNode[] = [];
+        const ensureDir = (parts: string[], index: number, relSoFar: string): ShaderDirectoryNode => {
+            const key = parts.slice(0, index + 1).join('/');
+            let dir = this.dirCache.get(key);
+            if (!dir) {
+                const name = parts[index];
+                dir = { kind: 'directory', name, relPath: key, children: [], fileCount: 0 };
+                this.dirCache.set(key, dir);
+                if (index === 0) { roots.push(dir); }
+                else {
+                    const parent = ensureDir(parts, index - 1, parts.slice(0, index).join('/'));
+                    if (!parent.children.some(c => c.kind === 'directory' && (c as ShaderDirectoryNode).relPath === key)) {
+                        parent.children.push(dir);
+                    }
+                }
+            }
+            return dir;
+        };
+        for (const file of this.files.values()) {
+            const relPath = vscode.workspace.asRelativePath(file.uri);
+            const parts = relPath.split(/[/\\]/);
+            if (parts.length <= 1) {
+                // File at workspace root — place directly in root list.
+                roots.push(file);
+            } else {
+                const dirParts = parts.slice(0, -1);
+                const dir = ensureDir(dirParts, dirParts.length - 1, '');
+                dir.children.push(file);
+            }
+        }
+        // Sort: directories first (by name), then files (by name).
+        const sortNodes = (nodes: ShaderVariantNode[]) => {
+            nodes.sort((a, b) => {
+                const aIsDir = a.kind === 'directory';
+                const bIsDir = b.kind === 'directory';
+                if (aIsDir !== bIsDir) { return aIsDir ? -1 : 1; }
+                const aName = a.kind === 'directory' ? (a as ShaderDirectoryNode).name : (a as ShaderVariantFile).uri.path;
+                const bName = b.kind === 'directory' ? (b as ShaderDirectoryNode).name : (b as ShaderVariantFile).uri.path;
+                return aName.localeCompare(bName);
+            });
+        };
+        sortNodes(roots);
+        for (const dir of this.dirCache.values()) { sortNodes(dir.children); }
+        // Compute recursive file counts (post-order).
+        for (const dir of this.dirCache.values()) {
+            let count = 0;
+            for (const child of dir.children) {
+                if (child.kind === 'file') { count++; }
+                else if (child.kind === 'directory') { count += (child as ShaderDirectoryNode).fileCount; }
+            }
+            dir.fileCount = count;
+        }
+        this.dirTreeRoots = roots;
+        return roots;
     }
     // Build (or reuse cached) entry-point groups for a file. Cached objects keep stable identity so
     // tree expansion & checkbox state survive refreshes; invalidated on variant-set change.
@@ -1309,7 +1419,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 stageNode: { kind: 'groupStage', stage: group.stage },
                 commonDefineList: {
                     kind: 'commonDefineList',
-                    defines: group.commonDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+                    defines: group.commonDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value, groupName: group.name })),
                 },
                 varyingDefineList,
                 includeList: {
@@ -1322,7 +1432,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                         kind: 'permutation',
                         variant: p.variant,
                         label: p.variant.custom && p.variant.custom.length > 0 ? `#${index} [${p.variant.custom}]` : `#${index}`,
-                        deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value })),
+                        deltaDefines: p.deltaDefines.map((d): ShaderReadonlyDefine => ({ kind: 'readonlyDefine', label: d.label, value: d.value, groupName: group.name })),
                     })),
                 },
             };
@@ -1333,6 +1443,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private invalidateGroups(filePath: string) {
         this.groupCache.delete(filePath);
         this.varyingSelection.clear();
+        this.dirTreeRoots = null;
     }
     // Seed varyingSelection from the active permutation in a group (used on first group build).
     private initVaryingSelectionFromGroup(group: EntryGroupData, selectionKey: string): void {
@@ -1443,18 +1554,57 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         const groups = this.groupCache.get(filePath);
         return groups?.find(g => g.name === groupName);
     }
+    // Resolve a readonlyDefine node from the grouped view back to its owning entry group, container
+    // (commonDefineList vs permutation.deltaDefines), file, and optionally the owning variant.
+    private resolveGroupedDefine(node: ShaderReadonlyDefine): {
+        file: ShaderVariantFile; group: ShaderEntryGroup;
+        container: ShaderCommonDefineList | ShaderPermutation;
+        variant?: ShaderVariant;
+    } | null {
+        for (const groups of this.groupCache.values()) {
+            for (const group of groups) {
+                if (node.groupName && group.name !== node.groupName) { continue; }
+                // Check commonDefineList
+                if (group.commonDefineList.defines.some(d => d === node)) {
+                    return { file: this.files.get(group.uri.path)!, group, container: group.commonDefineList };
+                }
+                // Check deltaDefines in each permutation
+                for (const perm of group.permutationList.permutations) {
+                    if (perm.deltaDefines.some(d => d === node)) {
+                        return { file: this.files.get(group.uri.path)!, group, container: perm, variant: perm.variant };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    // Find the owning entry group + file for a grouped-view container node (commonDefineList,
+    // varyingDefineList, permutationList) by identity.
+    private findEntryGroupByNode(node: ShaderVariantNode): { group: ShaderEntryGroup; file: ShaderVariantFile; } | null {
+        for (const [path, groups] of this.groupCache) {
+            for (const group of groups) {
+                if (group.commonDefineList === node || group.varyingDefineList === node || group.permutationList === node || group.includeList === node) {
+                    return { group, file: this.files.get(path)! };
+                }
+            }
+        }
+        return null;
+    }
     // Send the current varying-selection defines (common + selected varying) to the server so it
     // re-parses with them — even when the combination doesn't match any real permutation.
     private notifyVaryingSelection(selectionKey: string, sel: Map<string, string>): void {
         const ownerGroup = this.lookupEntryGroup(selectionKey);
         if (!ownerGroup) { return; }
-        // Merge common defines + selected varying defines (varying overrides common on conflict).
-        const fullDefines: { [key: string]: string } = {};
+        // Start with global shader-validator.defines; common + varying overlay on top (variant wins).
+        const globalDefines: { [key: string]: string } =
+            vscode.workspace.getConfiguration("shader-validator").get<{ [key: string]: string }>("defines") ?? {};
+        const fullDefines: { [key: string]: string } = { ...globalDefines };
         for (const d of ownerGroup.commonDefineList.defines) {
-            fullDefines[d.label] = d.value;
+            if (d.value !== '_') { fullDefines[d.label] = d.value; }
         }
         for (const [key, value] of sel) {
-            fullDefines[key] = value;
+            if (value === '_') { delete fullDefines[key]; }
+            else { fullDefines[key] = value; }
         }
         const includes = ownerGroup.includeList.includes.map(i => i.include);
         vscode.workspace.openTextDocument(ownerGroup.uri).then(doc => {
@@ -1478,6 +1628,30 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // Required for TreeView.reveal (used to auto-reveal a file node when its editor becomes active).
     public getParent(element: ShaderVariantNode): ShaderVariantNode | undefined {
         if (element.kind === 'file') {
+            if (this.treeMode) {
+                // In tree mode, find the parent directory from dirCache.
+                const relPath = vscode.workspace.asRelativePath(element.uri);
+                const lastSlash = Math.max(relPath.lastIndexOf('/'), relPath.lastIndexOf('\\'));
+                if (lastSlash >= 0) {
+                    const dirPath = relPath.slice(0, lastSlash);
+                    // Walk up to find the closest containing directory.
+                    let parts = dirPath.split(/[/\\]/);
+                    for (let i = parts.length; i > 0; i--) {
+                        const key = parts.slice(0, i).join('/');
+                        const dir = this.dirCache.get(key);
+                        if (dir) { return dir; }
+                    }
+                }
+            }
+            return undefined;
+        }
+        if (element.kind === 'directory') {
+            const dir = element as ShaderDirectoryNode;
+            const lastSlash = Math.max(dir.relPath.lastIndexOf('/'), dir.relPath.lastIndexOf('\\'));
+            if (lastSlash >= 0) {
+                const parentKey = dir.relPath.slice(0, lastSlash);
+                return this.dirCache.get(parentKey);
+            }
             return undefined;
         }
         if (element.kind === 'entryGroup') {
@@ -1671,7 +1845,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         const statusMessage = vscode.window.setStatusBarMessage("Collecting variant json...");
         try {
             let variants = await this.loadVariantsFromConfig(uri, forceRescan);
-            if (variants) {
+            if (variants && variants.length > 0) {
                 this.applyImportedVariants(uri, variants);
                 vscode.window.showInformationMessage(
                     `Collected ${variants.length} variant json entr${variants.length === 1 ? "y" : "ies"} for ${vscode.workspace.asRelativePath(uri)}.`,
@@ -1849,6 +2023,97 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 });
                 this.refresh(node, null);
             }
+        } else if (node.kind === 'commonDefineList') {
+            // Add a define to ALL permutations in this entry group.
+            const owner = this.findEntryGroupByNode(node);
+            if (!owner) { return; }
+            let label = await vscode.window.showInputBox({
+                title: "Macro label",
+                prompt: "Select a label for your macro (added to all permutations).",
+                placeHolder: "MY_MACRO"
+            });
+            if (!label) { return; }
+            let value = await vscode.window.showInputBox({
+                title: "Macro value", value: "1",
+                prompt: "Select a value.", placeHolder: "1"
+            });
+            if (!value) { return; }
+            for (const perm of owner.group.permutationList.permutations) {
+                let existing = perm.variant.defines.defines.find((d: { label: string }) => d.label === label);
+                if (existing) { existing.value = value; }
+                else { perm.variant.defines.defines.push({ kind: 'define', label, value }); }
+            }
+            this.invalidateGroups(owner.group.uri.path);
+            this.refresh(owner.file, owner.file);
+            this.notifyVariantChanged();
+        } else if (node.kind === 'varyingDefineList') {
+            // Add a define to the active permutation only.
+            const owner = this.findEntryGroupByNode(node);
+            if (!owner) { return; }
+            const activePerm = owner.group.permutationList.permutations.find(p => p.variant.isActive);
+            let label = await vscode.window.showInputBox({
+                title: "Macro label", placeHolder: "MY_MACRO",
+                prompt: `Add to ${activePerm ? 'active' : 'first'} permutation`,
+            });
+            if (!label) { return; }
+            let value = await vscode.window.showInputBox({
+                title: "Macro value", value: "1",
+                prompt: "Select a value.", placeHolder: "1"
+            });
+            if (!value) { return; }
+            const target = activePerm ?? owner.group.permutationList.permutations[0];
+            if (!target) { return; }
+            let existing = target.variant.defines.defines.find((d: { label: string }) => d.label === label);
+            if (existing) { existing.value = value; }
+            else { target.variant.defines.defines.push({ kind: 'define', label, value }); }
+            this.invalidateGroups(owner.group.uri.path);
+            this.refresh(owner.file, owner.file);
+            this.notifyVariantChanged();
+        } else if (node.kind === 'varyingDefine') {
+            // Add a new value for this varying key by cloning EVERY existing permutation in the
+            // entry group and setting the key to the new value in each clone — this properly
+            // expands the combinatorial space (e.g. adding a 2nd value doubles the count).
+            let value = await vscode.window.showInputBox({
+                title: `New value for ${node.label}`,
+                prompt: `Create new permutations with ${node.label}=<value>`,
+                placeHolder: "2"
+            });
+            if (!value) { return; }
+            const owner = this.lookupEntryGroup(node.selectionKey);
+            if (!owner) { return; }
+            const newValue = value;
+            const clones: ShaderVariant[] = [];
+            for (const perm of owner.permutationList.permutations) {
+                const cloned: ShaderVariant = {
+                    kind: 'variant',
+                    uri: perm.variant.uri,
+                    name: perm.variant.name,
+                    isActive: false,
+                    stage: { kind: 'stage', stage: perm.variant.stage.stage },
+                    defines: {
+                        kind: 'defineList',
+                        defines: perm.variant.defines.defines.map(d => ({
+                            kind: 'define' as const, label: d.label,
+                            value: d.label === node.label ? newValue : d.value,
+                        })),
+                    },
+                    includes: {
+                        kind: 'includeList',
+                        includes: perm.variant.includes.includes.map(i => ({ kind: 'include' as const, include: i.include })),
+                    },
+                };
+                if (!cloned.defines.defines.some(d => d.label === node.label)) {
+                    cloned.defines.defines.push({ kind: 'define', label: node.label, value: newValue });
+                }
+                clones.push(cloned);
+            }
+            let file = this.files.get(owner.uri.path);
+            if (file) {
+                file.variants.push(...clones);
+                this.invalidateGroups(owner.uri.path);
+                this.refresh(file, file);
+                this.notifyVariantChanged();
+            }
         }
     }
     public async edit(node: ShaderVariantNode) {
@@ -1902,6 +2167,33 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 node.stage = stage;
                 this.refresh(node, null);
             }
+        } else if (node.kind === 'readonlyDefine') {
+            const resolved = this.resolveGroupedDefine(node);
+            if (!resolved) { return; }
+            let label = await vscode.window.showInputBox({
+                title: "Macro label", value: node.label,
+                prompt: "Select a label.", placeHolder: "MY_MACRO"
+            });
+            let value = await vscode.window.showInputBox({
+                title: "Macro value", value: node.value === '_' ? '' : node.value,
+                prompt: "Select a value (empty = undefined `_`).", placeHolder: "0"
+            });
+            const newValue = (value !== undefined && value !== '') ? value : '_';
+            if (resolved.container.kind === 'commonDefineList') {
+                // Update across ALL permutations.
+                for (const perm of resolved.group.permutationList.permutations) {
+                    let def = perm.variant.defines.defines.find(d => d.label === node.label);
+                    if (def) { def.value = newValue; }
+                    if (label && label !== node.label) { def!.label = label; }
+                }
+            } else {
+                // Update only the owning permutation.
+                let def = resolved.variant!.defines.defines.find(d => d.label === node.label);
+                if (def) { def.value = newValue; }
+                if (label && label !== node.label && def) { def.label = label; }
+            }
+            this.invalidateGroups(resolved.group.uri.path);
+            this.refresh(resolved.file, resolved.file);
         }
     }
     public delete(node: ShaderVariantNode) {
@@ -1955,6 +2247,57 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 if (found) {
                     break;
                 }
+            }
+        } else if (node.kind === 'readonlyDefine') {
+            const resolved = this.resolveGroupedDefine(node);
+            if (!resolved) { return; }
+            if (resolved.container.kind === 'commonDefineList') {
+                // Remove from ALL permutations.
+                for (const perm of resolved.group.permutationList.permutations) {
+                    let idx = perm.variant.defines.defines.findIndex((d: { label: string }) => d.label === node.label);
+                    if (idx > -1) { perm.variant.defines.defines.splice(idx, 1); }
+                }
+            } else {
+                // Remove from the owning permutation.
+                let idx = resolved.variant!.defines.defines.findIndex((d: { label: string }) => d.label === node.label);
+                if (idx > -1) { resolved.variant!.defines.defines.splice(idx, 1); }
+            }
+            this.invalidateGroups(resolved.group.uri.path);
+            this.refresh(resolved.file, resolved.file);
+        } else if (node.kind === 'varyingDefineValue') {
+            // Remove all permutations that have this key=value.
+            const owner = this.lookupEntryGroup(node.selectionKey);
+            if (!owner) { return; }
+            let file = this.files.get(owner.uri.path);
+            if (file) {
+                file.variants = file.variants.filter(v => {
+                    let def = v.defines.defines.find(d => d.label === node.defineKey);
+                    return !def || def.value !== node.label;
+                });
+                this.invalidateGroups(owner.uri.path);
+                this.refresh(file, file);
+                this.notifyVariantChanged();
+            }
+        } else if (node.kind === 'varyingDefine') {
+            // Delete this single varying key — remove it from all permutations' defines.
+            const owner = this.lookupEntryGroup(node.selectionKey);
+            if (!owner) { return; }
+            let file = this.files.get(owner.uri.path);
+            if (file) {
+                for (const perm of owner.permutationList.permutations) {
+                    perm.variant.defines.defines = perm.variant.defines.defines.filter(d => d.label !== node.label);
+                }
+                this.invalidateGroups(owner.uri.path);
+                this.refresh(file, file);
+                this.notifyVariantChanged();
+            }
+        } else if (node.kind === 'entryGroup') {
+            let file = this.files.get(node.uri.path);
+            if (file) {
+                file.variants = file.variants.filter(v => !(v.name === node.name && v.stage.stage === node.stageNode.stage));
+                this.invalidateGroups(node.uri.path);
+                this.refresh(file, file);
+                this.notifyVariantChanged();
             }
         }
     }
