@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
+import * as cp from 'child_process';
 import { CancellationToken, DocumentSymbol, DocumentSymbolRequest, DocumentUri, LanguageClient, ProtocolNotificationType, ProtocolRequestType, Range, SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentRegistrationOptions } from 'vscode-languageclient/node';
 // LSP protocol types for sending a synthetic didChange (forces server re-parse without dirtying the editor).
 import { DidChangeTextDocumentNotification, DidChangeConfigurationNotification } from 'vscode-languageserver-protocol';
-import { resolveVSCodeVariables, ShaderLanguageClient } from '../client';
+import { resolveVSCodeVariables, ShaderLanguageClient, isRunningOnWeb } from '../client';
 
 interface ShaderVariantSerialized {
     url: DocumentUri,
@@ -472,6 +473,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private lastSentShaderVariant: ShaderVariantSerialized | null = null;
     private lastSentShaderVariantUri: vscode.Uri | null = null;
     private shaderVariantNotificationQueue: Promise<void> = Promise.resolve();
+    // Monotonic id incremented per queued variant notification; used to coalesce a burst of
+    // notifications (a single user switch enqueues several) into one success/failure popup.
+    private notificationGeneration: number = 0;
     // Cached recursive listing of *.json files under the resolved variantFolder (rebuilt on open &
     // when the setting changes; reused while switching variants to avoid re-walking the tree).
     private jsonFileCache: { root: string, files: vscode.Uri[] } | null = null;
@@ -976,6 +980,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             && JSON.stringify(previous) !== JSON.stringify(shaderVariant));
         this.lastSentShaderVariant = shaderVariant;
         this.lastSentShaderVariantUri = symbolUri ?? null;
+        // Tag this enqueue so only the most recent notification in a burst reports its result
+        // (a single user switch enqueues several notifications; we want just one popup).
+        const generation = ++this.notificationGeneration;
         this.shaderVariantNotificationQueue = this.shaderVariantNotificationQueue
             .then(async () => {
                 if (shouldForceTransition) {
@@ -1015,10 +1022,33 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     }
                     await this.requestDocumentSymbol(symbolUri);
                 }
+                if (generation === this.notificationGeneration) {
+                    this.showVariantSwitchResult(shaderVariant, null);
+                }
             })
             .catch(error => {
                 console.warn("Failed to send shader variant notification", error);
+                if (generation === this.notificationGeneration) {
+                    this.showVariantSwitchResult(shaderVariant, error);
+                }
             });
+    }
+    // Notify the user of the outcome of a variant switch. Failures are surfaced as an error popup
+    // (they would otherwise be silent); successes show a brief, non-intrusive status-bar message.
+    // Only the latest notification of a burst calls this (see notificationGeneration), so a single
+    // user switch yields a single message. Clearing the variant (null) shows no success message.
+    private showVariantSwitchResult(shaderVariant: ShaderVariantSerialized | null, error: unknown): void {
+        if (error) {
+            const target = shaderVariant ? ` to "${shaderVariant.entryPoint}"` : '';
+            vscode.window.showErrorMessage(`Failed to switch shader variant${target}: ${error instanceof Error ? error.message : String(error)}`);
+            return;
+        }
+        if (shaderVariant) {
+            const defineCount = Object.keys(shaderVariant.defines ?? {}).length;
+            vscode.window.setStatusBarMessage(`$(check) Shader variant: ${shaderVariant.entryPoint} (${defineCount} define${defineCount === 1 ? '' : 's'})`, 4000);
+        } else {
+            vscode.window.setStatusBarMessage(`$(circle-slash) Shader variant cleared`, 3000);
+        }
     }
     private getEffectiveDefinesForVariant(variant: ShaderVariant): { [key: string]: string } {
         // Start with global shader-validator.defines as a base; the variant's own defines
@@ -1872,6 +1902,80 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
         }
     }
+    // Collect candidate JSON config files for a shader whose source basename (without extension) is
+    // `stem`. When the variant folder lies inside the workspace we use VS Code's native, ripgrep-
+    // backed `findFiles` with a `**/<stem>*.json` glob: this returns ONLY the matching paths without
+    // walking the whole dump tree in JS — a large speedup for UE ShaderDebugInfo trees (one folder
+    // per permutation). `findFiles` can only search inside workspace folders, so when the variant
+    // folder is outside the workspace (or the stem contains glob metacharacters) we fall back to the
+    // manual recursive walk (collectJsonFiles), which the caller then filters by name as before.
+    private async collectShaderConfigFiles(folderUri: vscode.Uri, stem: string): Promise<vscode.Uri[]> {
+        // Only the fast paths require a simple stem (safe in both a glob and a shell command line);
+        // anything unusual falls straight through to the manual walk.
+        const stemIsSimple = /^[A-Za-z0-9_.\- ]+$/.test(stem);
+        if (stemIsSimple) {
+            // 1. Inside the workspace: VS Code's native, ripgrep-backed search returns only the
+            //    matching paths without a JS tree walk.
+            if (vscode.workspace.getWorkspaceFolder(folderUri) !== undefined) {
+                try {
+                    const pattern = new vscode.RelativePattern(folderUri, `**/${stem}*.json`);
+                    // exclude = null disables the default files.exclude / search.exclude so a dumped
+                    // folder (often gitignored or search-excluded, e.g. Saved/ShaderDebugInfo) is found.
+                    return await vscode.workspace.findFiles(pattern, null, 200000);
+                } catch (e) {
+                    console.warn("findFiles search failed, trying native search / manual walk", e);
+                }
+            }
+            // 2. Outside the workspace (where findFiles can't search): use the OS-native recursive
+            //    search. A single native process is far faster than thousands of readDirectory calls.
+            const native = await this.collectShaderConfigFilesNative(folderUri, stem);
+            if (native !== null) {
+                return native;
+            }
+        }
+        // 3. Fallback: manual recursive walk (caller cleared the cache already on forceRescan).
+        return this.collectJsonFiles(folderUri);
+    }
+    // Use the operating system's built-in recursive file search to list every `<stem>*.json` under
+    // a folder, walking the tree natively in one process — much faster than per-directory
+    // readDirectory calls through the extension-host FS layer, and works for folders outside the
+    // workspace. On Windows desktop this shells out to `dir /s /b /a-d` (a cmd.exe builtin); on
+    // other desktop platforms to `find <dir> -type f -name '<stem>*.json'`. Returns null when
+    // unavailable (web or a spawn failure) so the caller can fall back; returns an empty array when
+    // the OS searched and found nothing.
+    private collectShaderConfigFilesNative(folderUri: vscode.Uri, stem: string): Promise<vscode.Uri[] | null> {
+        if (isRunningOnWeb()) {
+            return Promise.resolve(null);
+        }
+        const folderPath = folderUri.fsPath;
+        const isWindows = process.platform === 'win32';
+        // Windows: cmd builtin `dir`. POSIX: `find`. Both list one full path per line.
+        const command = isWindows
+            ? `dir /s /b /a-d "${folderPath}\\${stem}*.json"`
+            : `find "${folderPath}" -type f -name "${stem}*.json"`;
+        return new Promise<vscode.Uri[] | null>((resolve) => {
+            const child = cp.exec(
+                command,
+                { maxBuffer: 256 * 1024 * 1024, windowsHide: true },
+                (error, stdout) => {
+                    // `dir` exits non-zero with no output ("File Not Found") when nothing matches;
+                    // `find` may exit non-zero on unreadable subdirs but still prints valid results.
+                    if (error && (!stdout || stdout.length === 0)) {
+                        resolve([]);
+                        return;
+                    }
+                    const uris = stdout
+                        .split(/\r?\n/)
+                        .map(line => line.trim())
+                        .filter(line => line.length > 0)
+                        .map(p => vscode.Uri.file(p));
+                    resolve(uris);
+                }
+            );
+            // Spawn failure (e.g. the tool is missing) — let the caller fall back to the manual walk.
+            child.on('error', () => resolve(null));
+        });
+    }
     // Recursively collect every *.json file under a folder, caching the listing per resolved root.
     // The folder is a tree of engine-dumped JSON configs (e.g. UE ShaderDebugInfo), so nested
     // directories are walked.
@@ -1923,13 +2027,16 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (forceRescan) {
             this.jsonFileCache = null;
         }
-        let jsonFiles = await this.collectJsonFiles(folderUri);
 
         // Pre-filter by file name so we only parse JSONs named after the opened shader (engines name
         // each dump <ShaderName>.json / <ShaderName>_DebugCompile.json), avoiding parsing the tree.
         let openedBaseName = getBaseName(uri.path);                 // e.g. FXAAShader.usf
         let dotIndex = openedBaseName.lastIndexOf('.');
-        let stemLower = (dotIndex > 0 ? openedBaseName.substring(0, dotIndex) : openedBaseName).toLowerCase();
+        let stemRaw = dotIndex > 0 ? openedBaseName.substring(0, dotIndex) : openedBaseName;
+        let stemLower = stemRaw.toLowerCase();
+        // Candidate JSONs: prefer VS Code's native (ripgrep-backed) search to pull only the files
+        // named after the shader; fall back to a full recursive walk when that's not possible.
+        let jsonFiles = await this.collectShaderConfigFiles(folderUri, stemRaw);
         let configs: ShaderVariantConfig[] = [];
         for (let fileUri of jsonFiles) {
             let jsonName = getBaseName(fileUri.path).toLowerCase();
