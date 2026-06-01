@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { CancellationToken, DocumentSymbol, DocumentSymbolRequest, DocumentUri, LanguageClient, ProtocolNotificationType, ProtocolRequestType, Range, SymbolInformation, SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentRegistrationOptions } from 'vscode-languageclient/node';
+// LSP protocol types for sending a synthetic didChange (forces server re-parse without dirtying the editor).
+import { DidChangeTextDocumentNotification } from 'vscode-languageserver-protocol';
 import { resolveVSCodeVariables, ShaderLanguageClient } from '../client';
 
 interface ShaderVariantSerialized {
@@ -514,6 +516,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         this.asyncGoToShaderEntryPoint = new Map;
         this.tree.onDidChangeCheckboxState(async (e: vscode.TreeCheckboxChangeEvent<ShaderVariantNode>) => {
             let varyingToggled = false;
+            let permutationActivated = false;
             for (let [node, checkboxState] of e.items) {
                 if (node.kind === 'permutation') {
                     let variant = node.variant;
@@ -522,12 +525,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                         await this.activateVariantWithRefresh(variant);
                         // After reload may have invalidated groupCache; sync again defensively.
                         this.syncVaryingSelectionFromVariant(variant);
+                        permutationActivated = true;
                     } else {
-                        variant.isActive = false; // unchecked
-                        let file = this.files.get(variant.uri.path);
-                        if (file) {
-                            this.refresh(file, file);
-                        }
+                        // Deactivation is handled by activateVariantWithRefresh when a different
+                        // permutation is checked in the same batch.  For a pure uncheck (no new
+                        // active), the end-of-handler refresh picks it up.
+                        variant.isActive = false;
                     }
                 } else if (node.kind === 'varyingDefineValue') {
                     varyingToggled = true;
@@ -585,6 +588,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             // varying defines were toggled the varying-selection helpers above already sent the
             // right defines (including synthetic ones for invalid/incomplete combinations).
             if (!varyingToggled) {
+                if (!permutationActivated) {
+                    // Pure uncheck (no new permutation selected): refresh the tree and notify the
+                    // server so it re-parses with base defines.
+                    this.refreshAll();
+                }
                 this.notifyVariantChanged();
             }
             this.save();
@@ -919,6 +927,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     }
     private sendShaderVariantNotification(shaderVariant: ShaderVariantSerialized | null, symbolUri?: vscode.Uri, forceReset: boolean = false) {
         const previous = this.lastSentShaderVariant;
+        // Fire a null→real handshake when switching between two non-null variants so the server
+        // detects the define-set change and re-resolves.  No delay is necessary — the two LSP
+        // messages are ordered; the server processes null (clear) then the new variant (re-parse).
         const shouldForceTransition = forceReset || (previous !== null
             && shaderVariant !== null
             && JSON.stringify(previous) !== JSON.stringify(shaderVariant));
@@ -930,14 +941,26 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     await this.server.sendNotification(didChangeShaderVariantNotification, {
                         shaderVariant: null,
                     });
-                    // Separate "clear old variant" from "apply new variant" so the server does
-                    // not batch them into the same processing pass.
-                    await new Promise(resolve => setTimeout(resolve, 25));
                 }
                 await this.server.sendNotification(didChangeShaderVariantNotification, {
                     shaderVariant,
                 });
                 if (symbolUri) {
+                    // Send a synthetic textDocument/didChange with the full file content to force
+                    // the server to re-parse.  didChangeShaderVariant alone updates the defines on
+                    // the server side, but many servers only re-parse on an actual document-change
+                    // event.  We send the full text through the LSP channel directly — no editor
+                    // edit, no dirty file.
+                    const doc = vscode.workspace.textDocuments.find(d => d.uri.path === symbolUri.path);
+                    if (doc) {
+                        await this.server.sendNotification(DidChangeTextDocumentNotification.type, {
+                            textDocument: {
+                                uri: this.server.uriAsString(symbolUri),
+                                version: doc.version,
+                            },
+                            contentChanges: [{ text: doc.getText() }],
+                        });
+                    }
                     await this.requestDocumentSymbol(symbolUri);
                 }
             })
@@ -1021,9 +1044,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         // When editing variant, might need to send it if holding an active one.
         if (this.hasActiveVariant(file))  {
             this.notifyVariantChanged();
+            // sendShaderVariantNotification will queue the null→real handshake,
+            // a synthetic didChange, and a documentSymbol request — no need to
+            // request symbols here (it would race ahead with stale defines).
+        } else {
+            this.requestDocumentSymbol(file.uri);
         }
-        // Symbols might have changed, so request them as we use this to compute symbols.
-        this.requestDocumentSymbol(file.uri);
     }
     public onDocumentSymbols(uri: vscode.Uri, symbols: vscode.DocumentSymbol[]) {
         // TODO:TREE: need to recurse child as well.
@@ -1704,41 +1730,20 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (file && !toActivate) {
             vscode.window.showWarningMessage(`The selected shader variant no longer exists for ${vscode.workspace.asRelativePath(clicked.uri)}. Use the Refresh button to re-import configs.`);
         }
-        // Phase 1: clear the previous active variant(s) first so switching A -> B behaves like a
-        // manual uncheck followed by a check, which the server handles more reliably.
-        let hadActiveVariant = false;
+        // Single-pass activation: deactivate the old variant(s) and activate the new one
+        // in one sweep.  The server receives a single didChangeShaderVariant with the new
+        // defines (or null if clearing); no null→wait→real workaround is needed.
         for (let [, otherFile] of this.files) {
             let needRefresh = false;
             for (let other of otherFile.variants) {
-                if (other.isActive) {
-                    hadActiveVariant = true;
-                    other.isActive = false;
+                let shouldBeActive = (toActivate !== undefined && other === toActivate);
+                if (other.isActive !== shouldBeActive) {
+                    other.isActive = shouldBeActive;
                     needRefresh = true;
                 }
             }
             if (needRefresh) {
                 this.refresh(otherFile, otherFile);
-            }
-        }
-        if (hadActiveVariant) {
-            this.sendShaderVariantNotification(null, toActivate?.uri ?? clicked.uri, true);
-            await this.shaderVariantNotificationQueue;
-            await new Promise(resolve => setTimeout(resolve, 25));
-        }
-        // Phase 2: activate the requested variant.
-        if (toActivate) {
-            for (let [, otherFile] of this.files) {
-                let needRefresh = false;
-                for (let other of otherFile.variants) {
-                    let shouldBeActive = other === toActivate;
-                    if (other.isActive !== shouldBeActive) {
-                        other.isActive = shouldBeActive;
-                        needRefresh = true;
-                    }
-                }
-                if (needRefresh) {
-                    this.refresh(otherFile, otherFile);
-                }
             }
         }
     }
