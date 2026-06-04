@@ -31,6 +31,27 @@ Currently, it support some features and languages:
 
 ## Features
 
+### Variant upgrades overview
+
+Recent updates improved the variant workflow in these areas:
+
+- `shader-validator.variantFolder` supports recursive JSON discovery and merge/dedup by full variant signature (`entryPoint + stage + defines + includes`).
+- Multi-file config form (`{ files: [...] }`) is supported for runtime merge of many permutation JSON files.
+- Grouped variant UI by **entry point + stage** exposes `common defines/includes` and per-permutation delta defines.
+- Variant switching now uses a more reliable LSP re-parse flow (`didChange + documentSymbol`) without dirtying editors.
+- Variant panel UX adds tree/flat file toggle, grouped-node inline add/edit/delete, and copy/search define actions.
+
+### Variant quick start (3 minutes)
+
+If you only care about the new variant workflow, start here:
+
+1. Set `shader-validator.variantFolder` to your JSON dump root (for UE, typically a `Saved/ShaderDebugInfo` root).
+2. Open a shader file, then run **Add current file** (`shader-validator.addCurrentFile`) from the Shader Variants view title.
+3. Click **Refresh variants from config** (`shader-validator.refreshVariants`) whenever JSON files changed on disk.
+4. In grouped view, check one permutation (`#N`) to activate it and update analysis/regions.
+5. Use inline add/edit/delete on grouped nodes (`common defines`, `varying defines`, `entry group`) to adjust permutations quickly.
+6. Use **Toggle tree / flat view** (`shader-validator.toggleTreeView`) to switch between directory tree and flat file list.
+
 ### Syntax highlighting
 
 This extension provide improved syntax highlighting for HLSL, GLSL & WGSL than the base one in VS code.
@@ -91,21 +112,34 @@ Add inlay hints to your function calls.
 
 ### Variants
 
-Swap shader variant on the fly to change entry point & macro definition. This allow you to define and easily change between the one you have set, affecting regions. For example when you have a lot of entry point in a single shader file, splitted using macros, or want to see the content from your dependencies with the context passed from you main entry point.
+Swap shader variants on the fly to change entry point, stage, macros and includes. This affects region analysis and symbol context immediately, and is especially useful when one shader file contains many macro-gated entry points.
 
-You can then access these variants directly from the dedicated window and then access them by clicking on them.
+The Variant panel now supports a grouped workflow:
 
-A neat feature for big shader codebase with lot of entry point everywhere !
+- Group by **entry point + stage**
+- Show **common defines/includes** once per group
+- Keep per-permutation delta defines under `defines`
+- Inline add/edit/delete on grouped nodes
+- Copy/search define name directly from tree items
+- Tree/flat file mode toggle for large projects
 
-You can add one with the dedicated window or using the command `shader-validator.addCurrentFileVariant`. It will also help dxc and glslang validating your file in a huge codebase where DXC take a lot of time to validate using the lib profile.
+You can still add a variant manually via `shader-validator.addCurrentFileVariant`, but importing from JSON config is recommended for large permutation sets.
 
 ![shader-variant](res/doc/variants.png)
 
 ### Importing variants
 
-Defining variants by hand is tedious when a shader has many permutations. Instead, set `shader-validator.variantFolder` to a folder of JSON configs. When you open a shader, the extension **recursively scans** that folder for every JSON whose `file` matches the opened shader and **merges** them — all entry points and permutations, de-duplicated — into that shader's variants. It works both for a single hand-written `<name>.json` and for a deep tree of one-permutation-per-file dumps such as Unreal Engine's `Saved/ShaderDebugInfo` (point the setting at the dump root). The configs are the source of truth: re-opening the shader re-syncs the view, and switching the active variant re-reads the matching files.
+Defining variants by hand is tedious when a shader has many permutations. Instead, set `shader-validator.variantFolder` to a folder of JSON configs.
 
-This is handy for engines such as Unreal that can dump every compiled permutation of a shader (entry point, stage and defines) to disk. Each dumped file is one permutation; the extension folds them together on open.
+The extension recursively scans that folder, picks JSON files matching the opened shader file name, and merges all matching variants (deduped by full signature). This works for:
+
+- one hand-written config file
+- deep trees of one-permutation-per-file dumps (for example Unreal Engine ShaderDebugInfo)
+
+Important behavior:
+
+- Config import is **manual refresh driven**: use `shader-validator.refreshVariants` to re-read JSON changes from disk.
+- Variant switching does not rescan JSON files; it only changes active context.
 
 ```json
 {
@@ -128,7 +162,9 @@ This is handy for engines such as Unreal that can dump every compiled permutatio
 }
 ```
 
-`stage` accepts any of the supported stage names (`vertex`, `fragment`, `compute`, `geometry`, `mesh`, `task`, `rayGeneration`, `closestHit`, `anyHit`, `callable`, `miss`, `intersect`, `tesselationControl`, `tesselationEvaluation`); omit it or set it to `null` to let the server guess. A multi-file form is also accepted, where the entry matching the opened shader file name is used:
+`stage` accepts any supported stage name (`vertex`, `fragment`, `compute`, `geometry`, `mesh`, `task`, `rayGeneration`, `closestHit`, `anyHit`, `callable`, `miss`, `intersect`, `tesselationControl`, `tesselationEvaluation`). Omit it or set it to `null` to let the server infer.
+
+Multi-file config form is also supported (the matching file entry is selected at runtime):
 
 ```json
 {
@@ -139,7 +175,7 @@ This is handy for engines such as Unreal that can dump every compiled permutatio
 }
 ```
 
-File-level `defines` and `includes` are also supported: anything set at the file level is applied to **every** variant of that file, with a variant's own `defines`/`includes` taking precedence on conflict. This lets you factor out the macros shared by all variants instead of repeating them in each one:
+File-level `defines` and `includes` are also supported: values set at file level apply to **every** variant in that file, while per-variant values win on conflict. This lets you factor out shared macros/includes:
 
 ```json
 {
@@ -177,7 +213,7 @@ This extension contributes the following settings:
 *   `shader-validator.stageDefine.[vertex|fragment|compute...]`: All custom macros and their values for custom shader stages.
 *   `shader-validator.serverPath`: Use a custom server instead of the bundled one.
 *   `shader-validator.updateSymbolsOnVariantUpdate`: Update symbol outline when changing variant. Will trigger a save event.
-*   `shader-validator.variantFolder`: Folder scanned recursively for JSON variant configs, merged per shader on open. See [Importing variants](#importing-variants).
+*   `shader-validator.variantFolder`: Folder scanned recursively for JSON variant configs. Import/update through Add Current File / Refresh. See [Importing variants](#importing-variants).
 *   `shader-validator.trace.server`: Show debug logs into an output channel. Can be accessed via shader-validator status bar.
 
 ### HLSL specific settings: 
@@ -204,7 +240,12 @@ This extension contributes the following settings:
 *   `shader-validator.startServer`: Start the server if it was stopped or crashed.
 *   `shader-validator.stopServer`: Stop the server.
 *   `shader-validator.restartServer`: Restart the server if you have any issue.
+*   `shader-validator.addCurrentFile`: Add active file to the variant panel (and import config if available).
 *   `shader-validator.addCurrentFileVariant`: Add a variant to the current file.
+*   `shader-validator.refreshVariants`: Re-import variants for a shader from `variantFolder`.
+*   `shader-validator.toggleTreeView`: Toggle flat/tree file display in the variant panel.
+*   `shader-validator.copyDefineName`: Copy define key from grouped variant nodes.
+*   `shader-validator.searchDefineName`: Search define key in current shader file.
 *   `shader-validator.showLogs`: Open the extension log window.
 *   `shader-validator.dumpDependency`: Print dependency tree in logs. mostly for debug.
 *   `shader-validator.dumpAst`: Print internal ast in logs. mostly for debug.

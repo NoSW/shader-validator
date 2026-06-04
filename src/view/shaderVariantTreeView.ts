@@ -456,6 +456,8 @@ function buildVaryingDefines(group: EntryGroupData, selectionKey: string): Shade
 }
 
 const shaderVariantTreeKey : string = 'shader-validator.shader-variant-tree-key';
+// Persisted user-defined aliases for varying define values. Key: "${selectionKey}::${defineKey}::${value}".
+const shaderVaryingValueAliasKey : string = 'shader-validator.shader-varying-value-alias-key';
 
 export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<ShaderVariantNode> {
 
@@ -469,7 +471,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private decorator: Map<string, vscode.TextEditorDecorationType>;
     private workspaceState: vscode.Memento;
     private shaderEntryPointList: Map<string, ShaderEntryPoint[]>;
-    private asyncGoToShaderEntryPoint: Map<vscode.Uri, string>;
+    // Keyed by uri.path (NOT the Uri object): vscode.Uri instances are not reference-stable across
+    // the tree node and the LSP middleware, so an object key would never match on resolution.
+    private asyncGoToShaderEntryPoint: Map<string, string>;
     private lastSentShaderVariant: ShaderVariantSerialized | null = null;
     private lastSentShaderVariantUri: vscode.Uri | null = null;
     private shaderVariantNotificationQueue: Promise<void> = Promise.resolve();
@@ -487,6 +491,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // Updated on permutation checkbox / varyingDefineValue checkbox changes, or initialized from the
     // active permutation when groups are built.  Keyed by string so it survives groupCache invalidation.
     private varyingSelection: Map<string, Map<string, string>> = new Map();
+    // User-defined aliases for varying define values, persisted across sessions.
+    // Key: "${selectionKey}::${defineKey}::${value}" → human-readable alias (e.g. "2" → "HighQuality").
+    private varyingValueAlias: Map<string, string> = new Map();
     // Toggle between flat file list and directory-tree view.
     private treeMode: boolean = false;
     // Cached directory tree (rebuilt when files change or treeMode toggles).
@@ -530,10 +537,13 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
             return [e.uri.path, e];
         }));
+        const aliasEntries = this.workspaceState.get<[string, string][]>(shaderVaryingValueAliasKey, []);
+        this.varyingValueAlias = new Map(aliasEntries);
     }
     private save() {
         let array = Array.from(this.files.values());
         this.workspaceState.update(shaderVariantTreeKey, array);
+        this.workspaceState.update(shaderVaryingValueAliasKey, Array.from(this.varyingValueAlias.entries()));
     }
 
     constructor(context: vscode.ExtensionContext, server: ShaderLanguageClient) {
@@ -771,6 +781,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 await this.jumpToFirstMatch(uri, text);
             }
         ));
+        context.subscriptions.push(vscode.commands.registerCommand(
+            "shader-validator.aliasVaryingValue",
+            async (node?: ShaderVariantNode) => {
+                if (!node || node.kind !== 'varyingDefineValue') {
+                    return;
+                }
+                await this.aliasVaryingDefineValue(node);
+            }
+        ));
         context.subscriptions.push(vscode.commands.registerCommand("shader-validator.editMenu", async (node: ShaderVariantNode) => {
             await this.edit(node);
             this.save();
@@ -825,13 +844,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                     this.shaderEntryPointList.delete(oldPath);
                     this.shaderEntryPointList.set(newPath, entryPoints);
                 }
-                const asyncEntryPoint = this.asyncGoToShaderEntryPoint.get(oldUri);
+                const asyncEntryPoint = this.asyncGoToShaderEntryPoint.get(oldPath);
                 if (asyncEntryPoint) {
-                    this.asyncGoToShaderEntryPoint.delete(oldUri);
-                    this.asyncGoToShaderEntryPoint.set(newUri, asyncEntryPoint);
+                    this.asyncGoToShaderEntryPoint.delete(oldPath);
+                    this.asyncGoToShaderEntryPoint.set(newPath, asyncEntryPoint);
                 }
-                this.shaderEntryPointList;
-                this.asyncGoToShaderEntryPoint;
             }
         }));
         // Auto-reveal the panel node for the active shader when switching/opening editors.
@@ -870,17 +887,78 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             vscode.commands.executeCommand('vscode.open', uri, <vscode.TextDocumentShowOptions>{
                 selection: entryPoint.range
             });
-        } else {
-            let editor = vscode.window.visibleTextEditors.find(e => e.document.uri === uri);
-            if (editor || !defer) {
-                // Already opened, but no entry point found.
-                vscode.window.showWarningMessage(`Failed to find entry point ${entryPointName} for file ${vscode.workspace.asRelativePath(uri)}`);
-            } else {
-                // Store request & open the file. Resolve goto on document request
-                this.asyncGoToShaderEntryPoint.set(uri, entryPointName);
-                vscode.commands.executeCommand('vscode.open', uri, <vscode.TextDocumentShowOptions>{});
-            }
+            return;
         }
+        // No symbol matched (e.g. the entry point is behind an inactive preprocessor region so the
+        // server never emitted a function symbol for it). If the document is already loaded, fall
+        // back to a whole-word, case-sensitive text search for the entry point name.
+        // NOTE: compare by `.path`, not by `===` on the Uri object (different instances never match).
+        const document = vscode.workspace.textDocuments.find(d => d.uri.path === uri.path);
+        if (document) {
+            const range = this.findEntryPointRangeByText(document, entryPointName);
+            if (range) {
+                vscode.commands.executeCommand('vscode.open', uri, <vscode.TextDocumentShowOptions>{
+                    selection: range
+                });
+            } else {
+                vscode.window.showWarningMessage(`Failed to find entry point ${entryPointName} for file ${vscode.workspace.asRelativePath(uri)}`);
+            }
+            return;
+        }
+        if (defer) {
+            // Document not loaded yet: open it, then resolve the goto once symbols arrive
+            // (onDocumentSymbols re-invokes this with defer=false, which then hits the text fallback).
+            this.asyncGoToShaderEntryPoint.set(uri.path, entryPointName);
+            vscode.commands.executeCommand('vscode.open', uri, <vscode.TextDocumentShowOptions>{});
+        } else {
+            vscode.window.showWarningMessage(`Failed to find entry point ${entryPointName} for file ${vscode.workspace.asRelativePath(uri)}`);
+        }
+    }
+    // Stable storage key for a varying define value's alias.
+    private varyingValueAliasKey(node: ShaderVaryingDefineValue): string {
+        return `${node.selectionKey}::${node.defineKey}::${node.label}`;
+    }
+    // Prompt for (or clear) a human-readable alias/tag on a varying define value (e.g. "2" → "HighQuality").
+    // The alias is purely a display aid in the panel; it does not change the value sent to the server.
+    private async aliasVaryingDefineValue(node: ShaderVaryingDefineValue): Promise<void> {
+        const key = this.varyingValueAliasKey(node);
+        const existing = this.varyingValueAlias.get(key);
+        const input = await vscode.window.showInputBox({
+            title: `Alias for ${node.defineKey} = ${node.label}`,
+            value: existing ?? '',
+            prompt: 'Set a readable alias/tag for this value (leave empty to clear).',
+            placeHolder: 'e.g. HighQuality',
+        });
+        if (input === undefined) {
+            return; // cancelled
+        }
+        const trimmed = input.trim();
+        if (trimmed.length === 0) {
+            this.varyingValueAlias.delete(key);
+        } else {
+            this.varyingValueAlias.set(key, trimmed);
+        }
+        this.save();
+        this.refreshTreeOnly();
+    }
+    // Fallback locator used when no document symbol matches the entry point name (e.g. the entry
+    // point lives in an inactive preprocessor region). Performs a whole-word, case-sensitive search
+    // for the exact name and returns the range of the LAST match, or null when none is found.
+    private findEntryPointRangeByText(document: vscode.TextDocument, entryPointName: string): vscode.Range | null {
+        const escaped = entryPointName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escaped}\\b`, 'g'); // no 'i' flag => case sensitive
+        const text = document.getText();
+        let lastMatch: RegExpExecArray | null = null;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(text)) !== null) {
+            lastMatch = match;
+        }
+        if (!lastMatch) {
+            return null;
+        }
+        const start = document.positionAt(lastMatch.index);
+        const end = document.positionAt(lastMatch.index + lastMatch[0].length);
+        return new vscode.Range(start, end);
     }
 
     private getFileAndParentNode(node: ShaderVariantNode) : [ShaderVariantFile, ShaderVariantNode | null] | null {
@@ -1172,9 +1250,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             };
         }));
         // Solve async request for goto.
-        let entryPoint = this.asyncGoToShaderEntryPoint.get(uri);
+        let entryPoint = this.asyncGoToShaderEntryPoint.get(uri.path);
         if (entryPoint) {
-            this.asyncGoToShaderEntryPoint.delete(uri);
+            this.asyncGoToShaderEntryPoint.delete(uri.path);
             this.goToShaderEntryPoint(uri, entryPoint, false);
         }
         this.updateDecorations();
@@ -1370,7 +1448,13 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             item.checkboxState = isChecked
                 ? vscode.TreeItemCheckboxState.Checked
                 : vscode.TreeItemCheckboxState.Unchecked;
-            item.tooltip = `Set "${element.defineKey}" to "${element.label}".`;
+            const alias = this.varyingValueAlias.get(this.varyingValueAliasKey(element));
+            if (alias) {
+                item.description = alias;
+                item.tooltip = `Set "${element.defineKey}" to "${element.label}" (alias: ${alias}).`;
+            } else {
+                item.tooltip = `Set "${element.defineKey}" to "${element.label}".`;
+            }
             item.contextValue = element.kind;
             return item;
         } else {

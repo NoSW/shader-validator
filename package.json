@@ -549,6 +549,12 @@
         "icon": "$(search)"
       },
       {
+        "command": "shader-validator.aliasVaryingValue",
+        "title": "Set alias for varying value",
+        "category": "Shader validator",
+        "icon": "$(tag)"
+      },
+      {
         "command": "shader-validator.toggleTreeView",
         "title": "Toggle tree / flat view",
         "category": "Shader validator",
@@ -611,6 +617,11 @@
           "command": "shader-validator.searchDefineName",
           "group": "inline@4",
           "when": "view == shader-validator-variants && (viewItem == varyingDefine || viewItem == readonlyDefine || viewItem == entryGroup)"
+        },
+        {
+          "command": "shader-validator.aliasVaryingValue",
+          "group": "inline@4",
+          "when": "view == shader-validator-variants && viewItem == varyingDefineValue"
         },
         {
           "command": "shader-validator.deleteMenu",
