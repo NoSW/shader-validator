@@ -9,6 +9,7 @@ import {
 	groupVariantsByEntryPoint,
 	variantSignature,
 	formatPermutationValueSummary,
+	migrateVaryingValueAliasEntries,
 	ShaderStage,
 } from '../../view/shaderVariantTreeView';
 
@@ -294,5 +295,19 @@ suite('Variant Import Test Suite', () => {
 		}));
 		assert.strictEqual(formatPermutationValueSummary(defines, ["A", "B", "C", "D"]), "1,0,_,2");
 		assert.strictEqual(formatPermutationValueSummary(defines, ["D", "B"]), "2,0");
+	});
+
+	test('migrateVaryingValueAliasEntries converts legacy scoped alias keys to global keys', () => {
+		const migrated = new Map(migrateVaryingValueAliasEntries([
+			// Legacy format: "${filePath}::${groupName}::${defineKey}::${value}".
+			['/d:/ws/FXAAShader.usf::FxaaPS::DIM_QUALITY::1', 'High'],
+			// Already-global entries pass through unchanged.
+			['DIM_ALPHA::0', 'Opaque'],
+			// Same define/value tagged in another file/group: last entry wins.
+			['/d:/ws/Other.usf::MainVS::DIM_QUALITY::1', 'Highest'],
+		]));
+		assert.strictEqual(migrated.size, 2);
+		assert.strictEqual(migrated.get('DIM_QUALITY::1'), 'Highest');
+		assert.strictEqual(migrated.get('DIM_ALPHA::0'), 'Opaque');
 	});
 });

@@ -532,10 +532,26 @@ export function formatPermutationValueSummary(defines: { label: string, value: s
 }
 
 const shaderVariantTreeKey : string = 'shader-validator.shader-variant-tree-key';
-// Persisted user-defined aliases for varying define values. Key: "${selectionKey}::${defineKey}::${value}".
+// Persisted user-defined aliases for varying define values. Key: "${defineKey}::${value}".
 const shaderVaryingValueAliasKey : string = 'shader-validator.shader-varying-value-alias-key';
+
+// Aliases were originally scoped per file & entry group ("${filePath}::${groupName}::${defineKey}::${value}"),
+// which silently detached every tag whenever re-collect / rename / re-dump rebuilt one of those
+// coordinates. They are now keyed globally by "${defineKey}::${value}" — a dimension define (e.g.
+// UE DIM_*) means the same thing wherever it appears, so one tag should apply everywhere and
+// survive any re-import. This converts persisted legacy entries; on key collision the last entry wins.
+export function migrateVaryingValueAliasEntries(entries: [string, string][]): [string, string][] {
+    const migrated = new Map<string, string>();
+    for (const [key, alias] of entries) {
+        const parts = key.split('::');
+        const normalized = parts.length >= 4 ? parts.slice(-2).join('::') : key;
+        migrated.set(normalized, alias);
+    }
+    return [...migrated.entries()];
+}
 const variantConfigReadConcurrency = 32;
 const shaderVariantNotificationDebounceMs = 75;
+const saveDebounceMs = 250;
 
 export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<ShaderVariantNode> {
 
@@ -576,7 +592,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // active permutation when groups are built.  Keyed by string so it survives groupCache invalidation.
     private varyingSelection: Map<string, Map<string, string>> = new Map();
     // User-defined aliases for varying define values, persisted across sessions.
-    // Key: "${selectionKey}::${defineKey}::${value}" → human-readable alias (e.g. "2" → "HighQuality").
+    // Key: "${defineKey}::${value}" → human-readable alias (e.g. "DIM_QUALITY::2" → "HighQuality").
+    // Deliberately NOT scoped to a file/entry group so tags survive re-collect and apply to every
+    // occurrence of the define across files & entry points.
     private varyingValueAlias: Map<string, string> = new Map();
     // Toggle between flat file list and directory-tree view.
     private treeMode: boolean = false;
@@ -584,6 +602,13 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private dirCache: Map<string, ShaderDirectoryNode> = new Map();
     private dirTreeRoots: ShaderVariantNode[] | null = null;
     private expandedTreeItemKeys: Set<string> = new Set();
+    // Trailing-debounce timer for workspaceState persistence (see save()).
+    private saveTimer: ReturnType<typeof setTimeout> | null = null;
+    // Raw entry-point grouping computed from a file's variants, cached per uri.path. Bridges
+    // pruneVaryingSelection (runs at invalidation time) and getEntryGroups (runs at next render)
+    // so a structural mutation only pays for groupVariantsByEntryPoint once; consumed (deleted)
+    // by getEntryGroups once the display projection is built.
+    private entryGroupDataCache: Map<string, EntryGroupData[]> = new Map();
 
     private inferShaderLanguageId(uri: vscode.Uri): string | null {
         const path = uri.path.toLowerCase();
@@ -600,6 +625,22 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             return 'wgsl';
         }
         return null;
+    }
+    // Language id of a shader file WITHOUT forcing the document to load. openTextDocument on a
+    // closed file reads it from disk and fires a didOpen to the language server, which then parses
+    // the whole include tree — pure overhead when all we need is the language id for a
+    // notification. Prefer an already-open document, then the file extension; only load as a last
+    // resort (unknown extension).
+    private async resolveShaderLanguageId(uri: vscode.Uri): Promise<string> {
+        const openDocument = vscode.workspace.textDocuments.find(d => d.uri.path === uri.path);
+        if (openDocument) {
+            return openDocument.languageId;
+        }
+        const inferred = this.inferShaderLanguageId(uri);
+        if (inferred) {
+            return inferred;
+        }
+        return (await vscode.workspace.openTextDocument(uri)).languageId;
     }
     private canManageShaderDocument(document: vscode.TextDocument | undefined): document is vscode.TextDocument {
         if (!document || document.uri.scheme !== 'file') {
@@ -623,9 +664,22 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             return [e.uri.path, e];
         }));
         const aliasEntries = this.workspaceState.get<[string, string][]>(shaderVaryingValueAliasKey, []);
-        this.varyingValueAlias = new Map(aliasEntries);
+        this.varyingValueAlias = new Map(migrateVaryingValueAliasEntries(aliasEntries));
     }
+    // Persisting serializes EVERY tracked file's variants (potentially tens of thousands of defines
+    // for UE dumps) across the extension-host RPC. save() is called after every checkbox toggle, so
+    // a burst of toggles would re-serialize the whole database each time; debounce instead and
+    // flush whatever is pending on dispose.
     private save() {
+        if (this.saveTimer) {
+            clearTimeout(this.saveTimer);
+        }
+        this.saveTimer = setTimeout(() => {
+            this.saveTimer = null;
+            this.flushSave();
+        }, saveDebounceMs);
+    }
+    private flushSave() {
         let array = Array.from(this.files.values());
         this.workspaceState.update(shaderVariantTreeKey, array);
         this.workspaceState.update(shaderVaryingValueAliasKey, Array.from(this.varyingValueAlias.entries()));
@@ -1020,6 +1074,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             clearTimeout(this.shaderVariantNotificationTimer);
             this.shaderVariantNotificationTimer = null;
         }
+        if (this.saveTimer) {
+            clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+            this.flushSave();
+        }
     }
     private getActiveVariant() : ShaderVariant | null {
         for (const file of this.files.values()) {
@@ -1104,9 +1163,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             vscode.window.showWarningMessage(`Failed to find entry point ${entryPointName} for file ${vscode.workspace.asRelativePath(uri)}`);
         }
     }
-    // Stable storage key for a varying define value's alias.
+    // Stable storage key for a varying define value's alias. Intentionally excludes the
+    // selectionKey (file path + entry group): those coordinates churn on re-collect / rename and
+    // would orphan the user's tags, and a dimension define carries the same meaning everywhere.
     private varyingValueAliasKey(node: ShaderVaryingDefineValue): string {
-        return `${node.selectionKey}::${node.defineKey}::${node.label}`;
+        return `${node.defineKey}::${node.label}`;
     }
     // Prompt for (or clear) a human-readable alias/tag on a varying define value (e.g. "2" → "HighQuality").
     // The alias is purely a display aid in the panel; it does not change the value sent to the server.
@@ -1226,41 +1287,21 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private refreshTreeOnly() {
         this.onDidChangeTreeDataEmitter.fire();
     }
+    // Firing a TreeDataChanged event for an element makes VS Code re-render that element AND its
+    // expanded descendants (collapsed ones re-render lazily on expand). So a single event on the
+    // topmost changed node refreshes the whole subtree; firing every descendant individually (as a
+    // previous revision did) floods the tree with thousands of events on large UE imports.
+    // Expansion state survives because groupCache keeps node identities stable.
     private refreshVaryingSelectionNodes(node: ShaderVaryingDefineValue): void {
         const ownerGroup = this.lookupEntryGroup(node.selectionKey);
         if (!ownerGroup) {
             this.refreshTreeOnly();
             return;
         }
-        const ownerDefine = ownerGroup.varyingDefineList.defines.find(d => d.label === node.defineKey);
         this.onDidChangeTreeDataEmitter.fire(ownerGroup.varyingDefineList);
-        if (ownerDefine) {
-            this.onDidChangeTreeDataEmitter.fire(ownerDefine);
-            for (const value of ownerDefine.values) {
-                this.onDidChangeTreeDataEmitter.fire(value);
-            }
-        }
     }
     private refreshActiveStateForFile(file: ShaderVariantFile): void {
         this.onDidChangeTreeDataEmitter.fire(file);
-        const groups = this.groupCache.get(file.uri.path);
-        if (!groups) {
-            return;
-        }
-        for (const group of groups) {
-            this.onDidChangeTreeDataEmitter.fire(group);
-            this.onDidChangeTreeDataEmitter.fire(group.varyingDefineList);
-            this.onDidChangeTreeDataEmitter.fire(group.permutationList);
-            for (const permutation of group.permutationList.permutations) {
-                this.onDidChangeTreeDataEmitter.fire(permutation);
-            }
-            for (const varyingDefine of group.varyingDefineList.defines) {
-                this.onDidChangeTreeDataEmitter.fire(varyingDefine);
-                for (const value of varyingDefine.values) {
-                    this.onDidChangeTreeDataEmitter.fire(value);
-                }
-            }
-        }
     }
     private withShaderAnalysisProgress<T>(uri: vscode.Uri | undefined, work: () => Promise<T>): Promise<T> {
         if (!uri) {
@@ -1470,13 +1511,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         let fileActiveVariant = this.getActiveVariant();
         if (fileActiveVariant) {
             const activeVariant = fileActiveVariant;
-            // Open document to get language ID.
-            // This does not open the document in the editor, only internally.
-            vscode.workspace.openTextDocument(activeVariant.uri).then(doc => {
+            this.resolveShaderLanguageId(activeVariant.uri).then(languageId => {
                 this.sendShaderVariantNotification(
                     shaderVariantToSerialized(
                         this.server.uriAsString(activeVariant.uri),
-                        capitalizeFirstLetter(doc.languageId), // Server expect it with capitalized first letter.
+                        capitalizeFirstLetter(languageId), // Server expect it with capitalized first letter.
                         activeVariant,
                         this.getEffectiveDefinesForVariant(activeVariant)
                     ),
@@ -1885,6 +1924,16 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         this.dirTreeRoots = roots;
         return roots;
     }
+    // Raw grouping shared by pruneVaryingSelection & getEntryGroups within one mutation cycle, so
+    // a structural change does not run groupVariantsByEntryPoint twice over huge variant lists.
+    private getEntryGroupData(file: ShaderVariantFile): EntryGroupData[] {
+        let cached = this.entryGroupDataCache.get(file.uri.path);
+        if (!cached) {
+            cached = groupVariantsByEntryPoint(file.variants);
+            this.entryGroupDataCache.set(file.uri.path, cached);
+        }
+        return cached;
+    }
     // Build (or reuse cached) entry-point groups for a file. Cached objects keep stable identity so
     // tree expansion & checkbox state survive refreshes; invalidated on variant-set change.
     private getEntryGroups(file: ShaderVariantFile): ShaderEntryGroup[] {
@@ -1892,7 +1941,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         if (cached) {
             return cached;
         }
-        let groups = groupVariantsByEntryPoint(file.variants).map((group): ShaderEntryGroup => {
+        let groups = this.getEntryGroupData(file).map((group): ShaderEntryGroup => {
             const selectionKey = `${file.uri.path}::${group.name}`;
             // Seed varyingSelection from the active permutation (only on first build).
             this.initVaryingSelectionFromGroup(group, selectionKey);
@@ -1936,11 +1985,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             };
         });
         this.groupCache.set(file.uri.path, groups);
+        // The display projection is built; the raw grouping has served its purpose. Drop it so
+        // huge intermediate arrays are not retained between mutations.
+        this.entryGroupDataCache.delete(file.uri.path);
         return groups;
     }
     private invalidateGroups(filePath: string) {
         this.groupCache.delete(filePath);
         this.variantSignatureCache.delete(filePath);
+        this.entryGroupDataCache.delete(filePath);
         this.dirTreeRoots = null;
         // Preserve the user's varying-define check state across structural changes: varyingSelection
         // is keyed by `${filePath}::${groupName}` and intentionally survives groupCache invalidation.
@@ -1961,7 +2014,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         const file = this.files.get(filePath);
         const validGroupKeys = new Set<string>();
         if (file) {
-            for (const group of groupVariantsByEntryPoint(file.variants)) {
+            for (const group of this.getEntryGroupData(file)) {
                 const selectionKey = `${filePath}::${group.name}`;
                 validGroupKeys.add(selectionKey);
                 const sel = this.varyingSelection.get(selectionKey);
@@ -2156,8 +2209,8 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             else { fullDefines[key] = value; }
         }
         const includes = ownerGroup.includeList.includes.map(i => i.include);
-        vscode.workspace.openTextDocument(ownerGroup.uri).then(doc => {
-            const shadeLang = doc.languageId.charAt(0).toUpperCase() + doc.languageId.slice(1);
+        this.resolveShaderLanguageId(ownerGroup.uri).then(languageId => {
+            const shadeLang = languageId.charAt(0).toUpperCase() + languageId.slice(1);
             this.sendShaderVariantNotification({
                     url: this.server.uriAsString(ownerGroup.uri),
                     shadingLanguage: shadeLang,
@@ -3045,11 +3098,10 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
         return decorator;
     }
-    private updateDecoration(editor: vscode.TextEditor) {
+    private updateDecoration(editor: vscode.TextEditor, variant: ShaderVariant | null) {
         let file = this.files.get(editor.document.uri.path);
         let entryPoints = this.shaderEntryPointList.get(editor.document.uri.path);
 
-        let variant = this.getActiveVariant();
         if (file && entryPoints) {
             if (variant) {
                 let found = false;
@@ -3075,9 +3127,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         }
     }
     private updateDecorations(uri?: vscode.Uri) {
+        // Scan for the active variant once, not once per visible editor (the scan walks every
+        // variant of every tracked file, which is large for UE imports).
+        const variant = this.getActiveVariant();
         for (let editor of vscode.window.visibleTextEditors) {
             if (editor.document.uri.scheme === 'file') {
-                this.updateDecoration(editor);
+                this.updateDecoration(editor, variant);
             }
         }
     }
