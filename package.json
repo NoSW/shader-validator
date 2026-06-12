@@ -555,6 +555,12 @@
         "icon": "$(tag)"
       },
       {
+        "command": "shader-validator.openVariantSourceJson",
+        "title": "Open variant source JSON",
+        "category": "Shader validator",
+        "icon": "$(go-to-file)"
+      },
+      {
         "command": "shader-validator.toggleTreeView",
         "title": "Toggle tree / flat view",
         "category": "Shader validator",
@@ -565,6 +571,10 @@
       "commandPalette": [
         {
           "command": "shader-validator.gotoShaderEntryPoint",
+          "when": "false"
+        },
+        {
+          "command": "shader-validator.openVariantSourceJson",
           "when": "false"
         }
       ],
@@ -622,6 +632,16 @@
           "command": "shader-validator.aliasVaryingValue",
           "group": "inline@4",
           "when": "view == shader-validator-variants && viewItem == varyingDefineValue"
+        },
+        {
+          "command": "shader-validator.gotoShaderEntryPoint",
+          "group": "inline@1",
+          "when": "view == shader-validator-variants && (viewItem == permutation || viewItem == permutationWithSource)"
+        },
+        {
+          "command": "shader-validator.openVariantSourceJson",
+          "group": "inline@2",
+          "when": "view == shader-validator-variants && viewItem == permutationWithSource"
         },
         {
           "command": "shader-validator.deleteMenu",

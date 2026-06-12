@@ -5,8 +5,10 @@ import {
 	parseShaderVariantConfig,
 	configToVariants,
 	mergeVariantConfigs,
+	mergeVariantConfigsWithSignatures,
 	groupVariantsByEntryPoint,
 	variantSignature,
+	formatPermutationValueSummary,
 	ShaderStage,
 } from '../../view/shaderVariantTreeView';
 
@@ -168,7 +170,8 @@ suite('Variant Import Test Suite', () => {
 			mk("W:/d/FXAAShader.usf", "FxaaVS", "vertex", {}),
 			mk("D:/a/Other.usf", "MainCS", "compute", {}),             // different shader -> excluded
 		];
-		let merged = mergeVariantConfigs(uri, configs, "FXAAShader.usf");
+		const entries = configs.map(c => ({ config: c, sourcePath: '/fake/config.json' }));
+		let merged = mergeVariantConfigs(uri, entries, "FXAAShader.usf");
 		assert.strictEqual(merged.length, 3);
 		let sig = (name: string, stage: ShaderStage, defs: string) =>
 			merged.some(v => v.name === name && v.stage.stage === stage && v.defines.defines.map(d => `${d.label}=${d.value}`).join(",") === defs);
@@ -176,6 +179,22 @@ suite('Variant Import Test Suite', () => {
 		assert.ok(sig("FxaaPS", ShaderStage.fragment, "P=1"));
 		assert.ok(sig("FxaaVS", ShaderStage.vertex, ""));
 		assert.ok(!merged.some(v => v.name === "MainCS"));
+	});
+
+	test('mergeVariantConfigsWithSignatures returns signatures aligned with variants', () => {
+		const mk = (defines: object) =>
+			parseShaderVariantConfig(JSON.stringify({ file: "FXAAShader.usf", variants: [{ entryPoint: "FxaaPS", stage: "fragment", defines }] }));
+		const entries = [
+			{ config: mk({ P: "0" }), sourcePath: '/fake/a.json' },
+			{ config: mk({ P: "1" }), sourcePath: '/fake/b.json' },
+			{ config: mk({ P: "0" }), sourcePath: '/fake/c.json' },
+		];
+		const merged = mergeVariantConfigsWithSignatures(uri, entries, "FXAAShader.usf");
+
+		assert.strictEqual(merged.variants.length, 2);
+		assert.strictEqual(merged.signatures.length, 2);
+		assert.deepStrictEqual(merged.signatures, merged.variants.map(variantSignature));
+		assert.deepStrictEqual(mergeVariantConfigs(uri, entries, "FXAAShader.usf").map(variantSignature), merged.signatures);
 	});
 
 	test('groupVariantsByEntryPoint groups by entry point, factors common defines, computes deltas', () => {
@@ -213,5 +232,67 @@ suite('Variant Import Test Suite', () => {
 		}));
 		let groups = groupVariantsByEntryPoint(configToVariants(uri, config, "FXAAShader.usf"));
 		assert.strictEqual(groups.length, 2);
+	});
+
+	test('groupVariantsByEntryPoint exposes missing varying defines as undefined', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			variants: [
+				{ entryPoint: "Main", stage: "compute", defines: { A: "1" } },
+				{ entryPoint: "Main", stage: "compute", defines: { B: "2" } }
+			]
+		}));
+		let groups = groupVariantsByEntryPoint(configToVariants(uri, config, "FXAAShader.usf"));
+		assert.strictEqual(groups.length, 1);
+		assert.deepStrictEqual(
+			groups[0].permutations.map(p => p.deltaDefines.map(d => `${d.label}=${d.value}`).sort()),
+			[["A=1", "B=_"], ["A=_", "B=2"]]
+		);
+	});
+
+	test('configToVariants with sourcePath sets sourceConfigPaths on the variant only', () => {
+		let config = parseShaderVariantConfig(JSON.stringify({
+			file: "FXAAShader.usf",
+			variants: [
+				{ entryPoint: "FxaaPS", stage: "fragment", defines: { P: "0" } },
+			]
+		}));
+		const sourcePath = '/D:/dumps/FXAAShader.json';
+		let variants = configToVariants(uri, config, "FXAAShader.usf", sourcePath);
+		assert.strictEqual(variants.length, 1);
+		let variant = variants[0];
+		assert.deepStrictEqual(variant.sourceConfigPaths, [sourcePath]);
+		// Provenance lives on the variant; defines stay plain label/value pairs.
+		for (let d of variant.defines.defines) {
+			assert.ok(!('sourceConfigPaths' in d));
+		}
+		// Without a sourcePath the field is absent entirely (manual variants).
+		let manual = configToVariants(uri, config, "FXAAShader.usf");
+		assert.strictEqual(manual[0].sourceConfigPaths, undefined);
+	});
+
+	test('mergeVariantConfigsWithSignatures merges source paths on dedup', () => {
+		const mk = (defines: object) =>
+			parseShaderVariantConfig(JSON.stringify({ file: "FXAAShader.usf", variants: [{ entryPoint: "FxaaPS", stage: "fragment", defines }] }));
+		const entries = [
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0.json' },
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0_dup.json' },
+		];
+		const merged = mergeVariantConfigsWithSignatures(uri, entries, "FXAAShader.usf");
+		assert.strictEqual(merged.variants.length, 1);
+		// Both source paths should be preserved.
+		assert.deepStrictEqual(
+			merged.variants[0].sourceConfigPaths,
+			['/dumps/FXAAShader_perm0.json', '/dumps/FXAAShader_perm0_dup.json']
+		);
+	});
+
+	test('formatPermutationValueSummary follows varying define order and omits names', () => {
+		const defines = ["B", "A", "D"].map((label, index) => ({
+			kind: "define" as const,
+			label,
+			value: String(index),
+		}));
+		assert.strictEqual(formatPermutationValueSummary(defines, ["A", "B", "C", "D"]), "1,0,_,2");
+		assert.strictEqual(formatPermutationValueSummary(defines, ["D", "B"]), "2,0");
 	});
 });
