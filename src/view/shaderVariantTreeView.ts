@@ -103,9 +103,11 @@ export type ShaderVariant = {
     defines: ShaderVariantDefineList;
     includes: ShaderVariantIncludeList;
     // JSON config file path(s) this variant was imported from (absent for manually-created
-    // variants). When several dumped JSONs describe the same permutation, paths are merged on
-    // dedup. Drives the inline "open source JSON" button on permutation tree items.
+    // variants). Kept as a single source path, selected from the newest sibling JSON when a dump
+    // folder contains several configs for the same shader. Drives the inline "open source JSON"
+    // button on permutation tree items.
     sourceConfigPaths?: string[];
+    sourceConfigCollectedAt?: number;
 };
 
 export type ShaderVariantFile = {
@@ -117,6 +119,7 @@ export type ShaderVariantMergeResult = {
     variants: ShaderVariant[],
     signatures: string[],
 };
+export type ShaderVariantConfigFileCandidate = { uri: vscode.Uri, mtime: number };
 type ImportedVariantSet = ShaderVariantMergeResult;
 type PendingShaderVariantNotification = {
     shaderVariant: ShaderVariantSerialized | null,
@@ -223,6 +226,11 @@ export interface ShaderVariantConfigMultiple {
     files: ShaderVariantConfigFile[],
 }
 export type ShaderVariantConfig = ShaderVariantConfigFile | ShaderVariantConfigMultiple;
+type ShaderVariantConfigEntry = { config: ShaderVariantConfig, sourcePath: string, collectedAt?: number };
+type SourceConfigCarrier = {
+    sourceConfigPaths?: string[],
+    sourceConfigCollectedAt?: number,
+};
 
 function validateConfigVariants(variants: any, context: string): void {
     if (!Array.isArray(variants)) {
@@ -274,10 +282,80 @@ function stageFromString(stage: string | null | undefined): ShaderStage {
     return (typeof value === 'number') ? value : ShaderStage.auto;
 }
 
+function sourceConfigInfo(sourcePath?: string, collectedAt?: number): SourceConfigCarrier {
+    if (!sourcePath) {
+        return {};
+    }
+    return {
+        sourceConfigPaths: [sourcePath],
+        sourceConfigCollectedAt: collectedAt ?? Date.now(),
+    };
+}
+
+function singleSourceConfigPath(sourcePaths: string[] | undefined): string | undefined {
+    if (!sourcePaths || sourcePaths.length === 0) {
+        return undefined;
+    }
+    return sourcePaths[0];
+}
+
+function copySourceConfigInfo<T extends SourceConfigCarrier>(target: T, source: SourceConfigCarrier): T {
+    const sourcePath = singleSourceConfigPath(source.sourceConfigPaths);
+    if (sourcePath) {
+        target.sourceConfigPaths = [sourcePath];
+    } else {
+        delete target.sourceConfigPaths;
+    }
+    if (source.sourceConfigCollectedAt !== undefined) {
+        target.sourceConfigCollectedAt = source.sourceConfigCollectedAt;
+    } else {
+        delete target.sourceConfigCollectedAt;
+    }
+    return target;
+}
+
+function mergeSourceConfigInfo(target: SourceConfigCarrier, source: SourceConfigCarrier): void {
+    const targetPath = singleSourceConfigPath(target.sourceConfigPaths);
+    const sourcePath = singleSourceConfigPath(source.sourceConfigPaths);
+    if (!sourcePath) {
+        if (targetPath) {
+            target.sourceConfigPaths = [targetPath];
+        }
+        return;
+    }
+    if (!targetPath) {
+        target.sourceConfigPaths = [sourcePath];
+        target.sourceConfigCollectedAt = source.sourceConfigCollectedAt;
+        return;
+    }
+    target.sourceConfigPaths = [targetPath];
+    if (sourcePath === targetPath && source.sourceConfigCollectedAt !== undefined) {
+        target.sourceConfigCollectedAt = Math.max(target.sourceConfigCollectedAt ?? 0, source.sourceConfigCollectedAt);
+    }
+}
+
+function sourceConfigPathsEqual(a: SourceConfigCarrier, b: SourceConfigCarrier): boolean {
+    const aPaths = a.sourceConfigPaths ?? [];
+    const bPaths = b.sourceConfigPaths ?? [];
+    if (aPaths.length !== bPaths.length) {
+        return false;
+    }
+    for (let i = 0; i < aPaths.length; i++) {
+        if (aPaths[i] !== bPaths[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function sourceConfigInfoEqual(a: SourceConfigCarrier, b: SourceConfigCarrier): boolean {
+    return sourceConfigPathsEqual(a, b) && a.sourceConfigCollectedAt === b.sourceConfigCollectedAt;
+}
+
 // Convert a parsed config into a list of ShaderVariant attached to the given uri. All imported
 // variants start inactive. openedBaseName (file name with extension) selects the matching entry
 // in the multi-file form. sourcePath is the JSON config file these variants were read from.
-export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, openedBaseName: string, sourcePath?: string): ShaderVariant[] {
+export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, openedBaseName: string, sourcePath?: string, sourceCollectedAt?: number): ShaderVariant[] {
     let fileConfig: ShaderVariantConfigFile | undefined;
     let files = (config as ShaderVariantConfigMultiple).files;
     if (Array.isArray(files)) {
@@ -295,6 +373,7 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
     // take precedence over the common ones on key (define) or path (include) conflict.
     let commonDefines = fileConfig.defines || {};
     let commonIncludes = fileConfig.includes || [];
+    const importedSource = sourceConfigInfo(sourcePath, sourceCollectedAt);
     return fileConfig.variants.map((variant: ShaderVariantConfigVariant): ShaderVariant => {
         // Merge defines: common first, then the variant's own (variant overrides on key conflict).
         let mergedDefines = new Map<string, string>();
@@ -318,7 +397,7 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
                 includes.push({ kind: 'include', include: include });
             }
         }
-        return {
+        return copySourceConfigInfo<ShaderVariant>({
             kind: 'variant',
             uri: uri,
             name: variant.entryPoint,
@@ -327,8 +406,7 @@ export function configToVariants(uri: vscode.Uri, config: ShaderVariantConfig, o
             stage: { kind: 'stage', stage: stageFromString(variant.stage) },
             defines: { kind: 'defineList', defines: defines },
             includes: { kind: 'includeList', includes: includes },
-            sourceConfigPaths: sourcePath ? [sourcePath] : undefined,
-        };
+        }, importedSource);
     });
 }
 
@@ -345,16 +423,43 @@ export function variantSignature(variant: ShaderVariant): string {
     });
 }
 
+function getDirectoryPath(filePath: string): string {
+    const normalized = filePath.replace(/\\/g, '/');
+    const lastSlash = normalized.lastIndexOf('/');
+    return lastSlash >= 0 ? normalized.substring(0, lastSlash) : '';
+}
+
+// When a dump folder contains several JSON configs for the opened shader stem (for example
+// `<ShaderName>.json` and `<ShaderName>_DebugCompile.json`), use the file write time instead of
+// suffix naming. The caller has already filtered candidates to the opened shader stem, so grouping
+// by directory is enough to keep one JSON per dump folder.
+export function preferNewestShaderStemJsonFiles(candidates: ShaderVariantConfigFileCandidate[]): vscode.Uri[] {
+    const bestByDirectory = new Map<string, ShaderVariantConfigFileCandidate>();
+    candidates.forEach((candidate) => {
+        const directory = getDirectoryPath(candidate.uri.path).toLowerCase();
+        const current = bestByDirectory.get(directory);
+        if (!current || candidate.mtime > current.mtime) {
+            bestByDirectory.set(directory, candidate);
+        }
+    });
+    const keep = new Set(
+        Array.from(bestByDirectory.values()).map(candidate => candidate.uri.toString())
+    );
+    return candidates
+        .filter(candidate => keep.has(candidate.uri.toString()))
+        .map(candidate => candidate.uri);
+}
+
 // Merge several parsed configs into one de-duplicated variant list for the opened shader. Used to
 // fold the many single-permutation JSON files an engine dumps (one per entry point x permutation)
 // into a single set. Single-file configs whose 'file' targets a different shader are skipped;
 // multi-file configs are matched by openedBaseName inside configToVariants. Identical permutations
-// (same variantSignature) are collapsed, merging their sourceConfigPaths.
-export function mergeVariantConfigsWithSignatures(uri: vscode.Uri, entries: {config: ShaderVariantConfig, sourcePath: string}[], openedBaseName: string): ShaderVariantMergeResult {
+// (same variantSignature) are collapsed while keeping a single source JSON path.
+export function mergeVariantConfigsWithSignatures(uri: vscode.Uri, entries: ShaderVariantConfigEntry[], openedBaseName: string): ShaderVariantMergeResult {
     let merged: ShaderVariant[] = [];
     let signatures: string[] = [];
     let seen = new Map<string, number>(); // signature → index in merged
-    for (let {config, sourcePath} of entries) {
+    for (let {config, sourcePath, collectedAt} of entries) {
         let isMultiFile = Array.isArray((config as ShaderVariantConfigMultiple).files);
         if (!isMultiFile) {
             let file = (config as ShaderVariantConfigFile).file;
@@ -362,7 +467,7 @@ export function mergeVariantConfigsWithSignatures(uri: vscode.Uri, entries: {con
                 continue; // single-file config describing a different shader
             }
         }
-        for (let variant of configToVariants(uri, config, openedBaseName, sourcePath)) {
+        for (let variant of configToVariants(uri, config, openedBaseName, sourcePath, collectedAt)) {
             let signature = variantSignature(variant);
             let existingIndex = seen.get(signature);
             if (existingIndex === undefined) {
@@ -370,25 +475,16 @@ export function mergeVariantConfigsWithSignatures(uri: vscode.Uri, entries: {con
                 merged.push(variant);
                 signatures.push(signature);
             } else {
-                // Merge source paths from the duplicate into the existing variant.
+                // Keep one source path for the duplicate variant.
                 let existing = merged[existingIndex];
-                if (variant.sourceConfigPaths && variant.sourceConfigPaths.length > 0) {
-                    if (!existing.sourceConfigPaths) {
-                        existing.sourceConfigPaths = [];
-                    }
-                    for (let p of variant.sourceConfigPaths) {
-                        if (!existing.sourceConfigPaths.includes(p)) {
-                            existing.sourceConfigPaths.push(p);
-                        }
-                    }
-                }
+                mergeSourceConfigInfo(existing, variant);
             }
         }
     }
     return { variants: merged, signatures };
 }
 
-export function mergeVariantConfigs(uri: vscode.Uri, entries: {config: ShaderVariantConfig, sourcePath: string}[], openedBaseName: string): ShaderVariant[] {
+export function mergeVariantConfigs(uri: vscode.Uri, entries: ShaderVariantConfigEntry[], openedBaseName: string): ShaderVariant[] {
     return mergeVariantConfigsWithSignatures(uri, entries, openedBaseName).variants;
 }
 
@@ -602,6 +698,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     private dirCache: Map<string, ShaderDirectoryNode> = new Map();
     private dirTreeRoots: ShaderVariantNode[] | null = null;
     private expandedTreeItemKeys: Set<string> = new Set();
+    private staleSourcePromptKeys: Set<string> = new Set();
     // Trailing-debounce timer for workspaceState persistence (see save()).
     private saveTimer: ReturnType<typeof setTimeout> | null = null;
     // Raw entry-point grouping computed from a file's variants, cached per uri.path. Bridges
@@ -655,14 +752,28 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
 
     private load() {
         let variants : ShaderVariantFile[] = this.workspaceState.get<ShaderVariantFile[]>(shaderVariantTreeKey, []);
+        const loadedAt = Date.now();
+        let migratedSourceMetadata = false;
         this.files = new Map(variants.map((e : ShaderVariantFile) => {
             // Seems that serialisation is breaking something, so this is required for uri & range to behave correctly.
             e.uri = vscode.Uri.from(e.uri);
             for (let variant of e.variants) {
                 variant.uri = vscode.Uri.from(variant.uri);
+                if (variant.sourceConfigPaths && variant.sourceConfigPaths.length > 1) {
+                    const sourcePath = singleSourceConfigPath(variant.sourceConfigPaths);
+                    variant.sourceConfigPaths = sourcePath ? [sourcePath] : undefined;
+                    migratedSourceMetadata = true;
+                }
+                if (variant.sourceConfigPaths && variant.sourceConfigPaths.length > 0 && variant.sourceConfigCollectedAt === undefined) {
+                    variant.sourceConfigCollectedAt = loadedAt;
+                    migratedSourceMetadata = true;
+                }
             }
             return [e.uri.path, e];
         }));
+        if (migratedSourceMetadata) {
+            this.workspaceState.update(shaderVariantTreeKey, Array.from(this.files.values()));
+        }
         const aliasEntries = this.workspaceState.get<[string, string][]>(shaderVaryingValueAliasKey, []);
         this.varyingValueAlias = new Map(migrateVaryingValueAliasEntries(aliasEntries));
     }
@@ -706,6 +817,28 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
         }
         return true;
+    }
+    private refreshImportedSourceMetadata(existingVariants: ShaderVariant[], importedVariants: ShaderVariant[]): { changed: boolean, sourcePathsChanged: boolean } {
+        let changed = false;
+        let sourcePathsChanged = false;
+        const importedBySignature = new Map<string, ShaderVariant>();
+        for (const imported of importedVariants) {
+            importedBySignature.set(variantSignature(imported), imported);
+        }
+        for (const existing of existingVariants) {
+            const imported = importedBySignature.get(variantSignature(existing));
+            if (!imported) {
+                continue;
+            }
+            if (!sourceConfigInfoEqual(existing, imported)) {
+                if (!sourceConfigPathsEqual(existing, imported)) {
+                    sourcePathsChanged = true;
+                }
+                copySourceConfigInfo(existing, imported);
+                changed = true;
+            }
+        }
+        return { changed, sourcePathsChanged };
     }
 
     constructor(context: vscode.ExtensionContext, server: ShaderLanguageClient) {
@@ -968,8 +1101,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
         ));
         // Inline button on permutation tree items (contextValue 'permutationWithSource'): opens the
-        // JSON config file(s) the permutation was imported from. With several sources (identical
-        // permutations dumped in multiple JSONs, merged on dedup), a quick pick lets the user choose.
+        // single JSON config file the permutation was imported from.
         context.subscriptions.push(vscode.commands.registerCommand(
             "shader-validator.openVariantSourceJson",
             async (node?: ShaderVariantNode) => {
@@ -2105,10 +2237,12 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
     // JSON config file path(s) a tree node's variant was imported from (empty for manual variants).
     private getSourceConfigPaths(node: ShaderVariantNode): string[] {
         if (node.kind === 'permutation') {
-            return node.variant.sourceConfigPaths ?? [];
+            const sourcePath = singleSourceConfigPath(node.variant.sourceConfigPaths);
+            return sourcePath ? [sourcePath] : [];
         }
         if (node.kind === 'variant') {
-            return node.sourceConfigPaths ?? [];
+            const sourcePath = singleSourceConfigPath(node.sourceConfigPaths);
+            return sourcePath ? [sourcePath] : [];
         }
         return [];
     }
@@ -2119,6 +2253,58 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         } catch (e) {
             // Dump folders get wiped & regenerated; the recorded path may no longer exist.
             vscode.window.showWarningMessage(`Cannot open variant source JSON ${fsPath}: ${e instanceof Error ? e.message : e}. Use Refresh to re-import configs.`);
+        }
+    }
+    private scheduleSourceFreshnessCheckForVariant(variant: ShaderVariant): void {
+        setTimeout(() => {
+            void this.promptRecollectIfSourceStale(variant);
+        }, shaderVariantNotificationDebounceMs + 10);
+    }
+    private async getStaleSourceConfigFiles(variant: ShaderVariant): Promise<{ sourcePath: string, mtime: number }[]> {
+        const sourcePath = singleSourceConfigPath(variant.sourceConfigPaths);
+        const sourcePaths = sourcePath ? [sourcePath] : [];
+        const collectedAt = variant.sourceConfigCollectedAt;
+        if (sourcePaths.length === 0) {
+            this.server.log(`[Variant JSON freshness] Skip ${variant.name}: no source JSON path recorded.`);
+            return [];
+        }
+        const stale: { sourcePath: string, mtime: number }[] = [];
+        for (const sourcePath of sourcePaths) {
+            try {
+                const sourceUri = vscode.Uri.file(sourcePath);
+                const stat = await vscode.workspace.fs.stat(sourceUri);
+                if (collectedAt === undefined || stat.mtime > collectedAt + 1) {
+                    stale.push({ sourcePath, mtime: stat.mtime });
+                } else {
+                    this.server.log(`[Variant JSON freshness] ${getBaseName(sourcePath)} is not newer than last collect.`);
+                }
+            } catch {
+                // Missing dump files are common after regeneration; the existing open-source-json
+                // command reports that case when the user explicitly asks to open the file.
+                this.server.log(`[Variant JSON freshness] Cannot stat source JSON: ${sourcePath}`);
+            }
+        }
+        return stale;
+    }
+    private async promptRecollectIfSourceStale(variant: ShaderVariant): Promise<void> {
+        const stale = await this.getStaleSourceConfigFiles(variant);
+        if (stale.length === 0) {
+            return;
+        }
+        const promptKey = `${variant.uri.path}::${stale.map(item => `${item.sourcePath}:${item.mtime}`).join('|')}`;
+        if (this.staleSourcePromptKeys.has(promptKey)) {
+            this.server.log(`[Variant JSON freshness] Prompt already shown for ${variant.name}.`);
+            return;
+        }
+        this.staleSourcePromptKeys.add(promptKey);
+        const sourceLabel = stale.length === 1 ? getBaseName(stale[0].sourcePath) : `${stale.length} JSON files`;
+        const choice = await vscode.window.showWarningMessage(
+            `${sourceLabel} was modified after the last variant JSON collect for ${vscode.workspace.asRelativePath(variant.uri)}. Re-collect now?`,
+            "Re-collect",
+            "Later",
+        );
+        if (choice === "Re-collect") {
+            await this.importVariantsFromConfig(variant.uri, true);
         }
     }
     private async jumpToFirstMatch(uri: vscode.Uri, searchString: string): Promise<void> {
@@ -2522,11 +2708,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         this.jsonFileCache = { root: folderUri.path, files };
         return files;
     }
-    private async readVariantConfigFiles(jsonFiles: vscode.Uri[]): Promise<{config: ShaderVariantConfig, sourcePath: string}[]> {
+    private async readVariantConfigFiles(jsonFiles: vscode.Uri[]): Promise<ShaderVariantConfigEntry[]> {
         if (jsonFiles.length === 0) {
             return [];
         }
-        const resultsByIndex = new Map<number, {config: ShaderVariantConfig, sourcePath: string}>();
+        const resultsByIndex = new Map<number, ShaderVariantConfigEntry>();
         let nextIndex = 0;
         const workerCount = Math.min(variantConfigReadConcurrency, jsonFiles.length);
         const decoder = new TextDecoder('utf-8');
@@ -2536,7 +2722,11 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 const fileUri = jsonFiles[index];
                 try {
                     let bytes = await vscode.workspace.fs.readFile(fileUri);
-                    resultsByIndex.set(index, { config: parseShaderVariantConfig(decoder.decode(bytes)), sourcePath: fileUri.fsPath });
+                    resultsByIndex.set(index, {
+                        config: parseShaderVariantConfig(decoder.decode(bytes)),
+                        sourcePath: fileUri.fsPath,
+                        collectedAt: Date.now(),
+                    });
                 } catch (e) {
                     let message = `Failed to import shader variants from ${fileUri.fsPath}: ${e instanceof Error ? e.message : e}`;
                     console.warn(message);
@@ -2548,6 +2738,20 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         return [...resultsByIndex.entries()]
             .sort((a, b) => a[0] - b[0])
             .map(([, result]) => result);
+    }
+    private async selectNewestShaderConfigFiles(jsonFiles: vscode.Uri[]): Promise<vscode.Uri[]> {
+        if (jsonFiles.length <= 1) {
+            return jsonFiles;
+        }
+        const candidates = await Promise.all(jsonFiles.map(async (fileUri): Promise<ShaderVariantConfigFileCandidate> => {
+            try {
+                const stat = await vscode.workspace.fs.stat(fileUri);
+                return { uri: fileUri, mtime: stat.mtime };
+            } catch {
+                return { uri: fileUri, mtime: 0 };
+            }
+        }));
+        return preferNewestShaderStemJsonFiles(candidates);
     }
     // Scan the configured variant folder for every JSON config describing the opened shader (all
     // entry points x all permutations, across nested directories) and merge them into one
@@ -2592,6 +2796,7 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
             }
             matchingJsonFiles.push(fileUri);
         }
+        matchingJsonFiles = await this.selectNewestShaderConfigFiles(matchingJsonFiles);
         let entries = await this.readVariantConfigFiles(matchingJsonFiles);
         if (entries.length === 0) {
             return null; // No config for this shader.
@@ -2628,6 +2833,15 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
         // Change detection by full signature, ignoring active state. New signatures were already
         // computed during merge/dedup; old signatures are cached by variants array identity.
         if (file && this.signaturesEqual(this.getVariantSignatures(file), imported.signatures)) {
+            const sourceMetadata = this.refreshImportedSourceMetadata(file.variants, variants);
+            if (sourceMetadata.changed) {
+                this.setVariantSignatures(uri.path, file.variants, imported.signatures);
+                this.save();
+                if (sourceMetadata.sourcePathsChanged) {
+                    this.invalidateGroups(uri.path);
+                    this.onDidChangeTreeDataEmitter.fire();
+                }
+            }
             return; // Nothing changed.
         }
         // Auto-activate a default variant after import/refresh so it immediately validates:
@@ -2692,6 +2906,9 @@ export class ShaderVariantTreeDataProvider implements vscode.TreeDataProvider<Sh
                 this.refreshActiveStateForFile(otherFile);
                 this.updateDependency(otherFile);
             }
+        }
+        if (toActivate) {
+            this.scheduleSourceFreshnessCheckForVariant(toActivate);
         }
     }
     async promptEntryPoint() : Promise<string | undefined> {

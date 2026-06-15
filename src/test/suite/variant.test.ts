@@ -10,6 +10,7 @@ import {
 	variantSignature,
 	formatPermutationValueSummary,
 	migrateVaryingValueAliasEntries,
+	preferNewestShaderStemJsonFiles,
 	ShaderStage,
 } from '../../view/shaderVariantTreeView';
 
@@ -250,7 +251,7 @@ suite('Variant Import Test Suite', () => {
 		);
 	});
 
-	test('configToVariants with sourcePath sets sourceConfigPaths on the variant only', () => {
+	test('configToVariants with sourcePath sets source metadata on the variant only', () => {
 		let config = parseShaderVariantConfig(JSON.stringify({
 			file: "FXAAShader.usf",
 			variants: [
@@ -258,33 +259,58 @@ suite('Variant Import Test Suite', () => {
 			]
 		}));
 		const sourcePath = '/D:/dumps/FXAAShader.json';
-		let variants = configToVariants(uri, config, "FXAAShader.usf", sourcePath);
+		const collectedAt = 123456;
+		let variants = configToVariants(uri, config, "FXAAShader.usf", sourcePath, collectedAt);
 		assert.strictEqual(variants.length, 1);
 		let variant = variants[0];
 		assert.deepStrictEqual(variant.sourceConfigPaths, [sourcePath]);
+		assert.strictEqual(variant.sourceConfigCollectedAt, collectedAt);
 		// Provenance lives on the variant; defines stay plain label/value pairs.
 		for (let d of variant.defines.defines) {
 			assert.ok(!('sourceConfigPaths' in d));
+			assert.ok(!('sourceConfigCollectedAt' in d));
 		}
 		// Without a sourcePath the field is absent entirely (manual variants).
 		let manual = configToVariants(uri, config, "FXAAShader.usf");
 		assert.strictEqual(manual[0].sourceConfigPaths, undefined);
+		assert.strictEqual(manual[0].sourceConfigCollectedAt, undefined);
 	});
 
-	test('mergeVariantConfigsWithSignatures merges source paths on dedup', () => {
+	test('preferNewestShaderStemJsonFiles keeps newest json per folder', () => {
+		const candidates = [
+			{ uri: vscode.Uri.file('/D:/dumps/A/FxaaPS.json'), mtime: 300 },
+			{ uri: vscode.Uri.file('/D:/dumps/A/FxaaPS_DebugCompile.json'), mtime: 200 },
+			{ uri: vscode.Uri.file('/D:/dumps/A/FxaaPS.variants.json'), mtime: 100 },
+			{ uri: vscode.Uri.file('/D:/dumps/B/FxaaPS.json'), mtime: 400 },
+			{ uri: vscode.Uri.file('/D:/dumps/B/FxaaPS_DebugCompile.json'), mtime: 500 },
+		];
+		assert.deepStrictEqual(
+			preferNewestShaderStemJsonFiles(candidates).map(file => file.path.replace(/^\//, '')),
+			[
+				'D:/dumps/A/FxaaPS.json',
+				'D:/dumps/B/FxaaPS_DebugCompile.json',
+			]
+		);
+	});
+
+	test('mergeVariantConfigsWithSignatures keeps one source path on dedup', () => {
 		const mk = (defines: object) =>
 			parseShaderVariantConfig(JSON.stringify({ file: "FXAAShader.usf", variants: [{ entryPoint: "FxaaPS", stage: "fragment", defines }] }));
 		const entries = [
-			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0.json' },
-			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0_dup.json' },
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0.json', collectedAt: 100 },
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_perm0_dup.json', collectedAt: 200 },
 		];
 		const merged = mergeVariantConfigsWithSignatures(uri, entries, "FXAAShader.usf");
 		assert.strictEqual(merged.variants.length, 1);
-		// Both source paths should be preserved.
-		assert.deepStrictEqual(
-			merged.variants[0].sourceConfigPaths,
-			['/dumps/FXAAShader_perm0.json', '/dumps/FXAAShader_perm0_dup.json']
-		);
+		assert.deepStrictEqual(merged.variants[0].sourceConfigPaths, ['/dumps/FXAAShader_perm0.json']);
+		assert.strictEqual(merged.variants[0].sourceConfigCollectedAt, 100);
+
+		const withDuplicate = mergeVariantConfigsWithSignatures(uri, [
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader.json', collectedAt: 100 },
+			{ config: mk({ P: "0" }), sourcePath: '/dumps/FXAAShader_DebugCompile.json', collectedAt: 200 },
+		], "FXAAShader.usf");
+		assert.deepStrictEqual(withDuplicate.variants[0].sourceConfigPaths, ['/dumps/FXAAShader.json']);
+		assert.strictEqual(withDuplicate.variants[0].sourceConfigCollectedAt, 100);
 	});
 
 	test('formatPermutationValueSummary follows varying define order and omits names', () => {
